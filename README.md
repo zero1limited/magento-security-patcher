@@ -27,7 +27,9 @@ Always keep the `-f` in `curl -fsSL`. Without it, a 404 or GitHub error page get
 ## What it does
 
 1. **Detects the installed version** from `php bin/magento -V`. If that fails it falls back to `composer.lock`, then `composer.json`.
-2. **Finds the bundles** on `https://repo.magento.com/patch/`, named like `2-4-7-p10-sep-2026.zip`. It checks every month from the last bundle it applied up to next month (the last 6 months on the first run). That's how next month's bundle gets picked up automatically.
+2. **Finds the bundles** in two ways:
+   - It reads the [list of known bundles](patches.txt) in this repo on every run.
+   - It checks `https://repo.magento.com/patch/` and `https://repo.magento.com/patch/auth/` for files named like `2-4-7-p10-sep-2026.zip`, for every month from the last bundle it applied up to next month (the last 6 months on the first run). That's how next month's bundle gets picked up automatically, even before it's added to the list.
 3. **Applies them in date order.** Each bundle is unpacked and all of its `.patch`/`.diff` files are applied with `patch -p1` from the Magento root. Where Adobe ships both a composer-format and a git-format version of a patch, it picks the one that matches how Magento is installed.
 4. **Rolls back on failure.** If any patch in a bundle won't apply cleanly, the patches already applied from that bundle are undone, an alert is raised, and no later bundles are attempted.
 5. **Stops if the site needs upgrading.** If a bundle needs a higher patch level than is installed (for example the bundle is for `2.4.7-p10` and the site is on `2.4.7-p9`), it raises an alert saying which version to upgrade to and applies nothing from that point on.
@@ -40,8 +42,10 @@ Running it again is safe. Bundles and patches that are already in place are dete
 | Option | Description |
 |---|---|
 | `-r, --root DIR` | Magento root (default: current directory) |
-| `-l, --list FILE` | File of extra bundle zip URLs to apply, one per line (`#` comments allowed) |
-| `-b, --base-url URL` | Location to look for bundles in (can be repeated; default `https://repo.magento.com/patch`) |
+| `-l, --list FILE` | Local file of extra bundle zip URLs to apply, one per line (`#` comments allowed) |
+| `--known-list URL` | Central list of known bundles (default: `patches.txt` in this repo) |
+| `--no-known-list` | Don't fetch the central list |
+| `-b, --base-url URL` | Location to look for bundles in (can be repeated; default `https://repo.magento.com/patch` and `https://repo.magento.com/patch/auth`) |
 | `--lookback N` | Months to look back when there's no history yet (default 6) |
 | `--lookahead N` | Months ahead of today to check (default 1) |
 | `-n, --dry-run` | Download and test-apply only, change nothing |
@@ -58,6 +62,12 @@ Running it again is safe. Bundles and patches that are already in place are dete
 | 1 | Error (download, auth, environment) |
 | 2 | Upgrade required before the next bundle can be applied |
 | 3 | A patch wouldn't apply cleanly; that bundle was rolled back |
+
+## Adding new bundles
+
+When Adobe publishes a new month's bundles, add their URLs to [`patches.txt`](patches.txt) and push. Every site picks them up on its next run, and the order of lines in the file doesn't matter because bundles are always applied by release date.
+
+Only `https://repo.magento.com/` URLs are accepted from this file, so a bad edit can't point sites at a zip hosted anywhere else.
 
 ## Credentials
 

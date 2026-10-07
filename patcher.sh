@@ -32,8 +32,11 @@ export LC_ALL=C
 # ---------------------------------------------------------------- defaults ---
 MAGENTO_ROOT="${MAGENTO_ROOT:-$(pwd)}"
 # Space-separated list of base locations probed for <ver>-p<N>-<mon>-<yyyy>.zip
-PATCH_BASE_URLS="${PATCH_BASE_URLS:-https://repo.magento.com/patch}"
-URL_LIST="${URL_LIST:-}"                  # optional file: one zip URL per line
+PATCH_BASE_URLS="${PATCH_BASE_URLS:-https://repo.magento.com/patch https://repo.magento.com/patch/auth}"
+URL_LIST="${URL_LIST:-}"                  # optional local file: one zip URL per line
+# Central list of known bundles, maintained in the GitHub repo and fetched on every run.
+# Only repo.magento.com URLs are accepted from it.
+KNOWN_LIST_URL="${KNOWN_LIST_URL-https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patches.txt}"
 LOOKBACK_MONTHS="${LOOKBACK_MONTHS:-6}"   # discovery window when no history
 LOOKAHEAD_MONTHS="${LOOKAHEAD_MONTHS:-1}" # also probe next month(s)
 P_AHEAD="${P_AHEAD:-3}"                   # probe up to N patch levels above installed
@@ -50,7 +53,9 @@ Usage: magento-security-patcher.sh [options]
        curl -fsSL <raw-url> | bash -s -- [options]
 
   -r, --root DIR          Magento root (default: current directory)
-  -l, --list FILE         File of explicit patch zip URLs (one per line, # comments ok)
+  -l, --list FILE         Local file of extra patch zip URLs (one per line, # comments ok)
+      --known-list URL    Central list of known bundles (default: patches.txt in the GitHub repo)
+      --no-known-list     Don't fetch the central list
   -b, --base-url URL      Base URL to probe (repeatable; default repo.magento.com/patch)
       --lookback N        Months to look back when no history exists (default $LOOKBACK_MONTHS)
       --lookahead N       Months ahead of today to probe (default $LOOKAHEAD_MONTHS)
@@ -73,6 +78,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--root)        MAGENTO_ROOT="$2"; shift 2 ;;
     -l|--list)        URL_LIST="$2"; shift 2 ;;
+    --known-list)     KNOWN_LIST_URL="$2"; shift 2 ;;
+    --no-known-list)  KNOWN_LIST_URL=""; shift ;;
     -b|--base-url)    CLI_BASES+=("${2%/}"); shift 2 ;;
     --lookback)       LOOKBACK_MONTHS="$2"; shift 2 ;;
     --lookahead)      LOOKAHEAD_MONTHS="$2"; shift 2 ;;
@@ -227,14 +234,29 @@ add_candidate() {  # add_candidate <url>  → "YYYYMM PLEVEL URL NAME" if it mat
   echo "$yr$mm $p $url ${name,,}" >>"$CANDIDATES"
 }
 
-# ------------------------------------------------- 1. explicit URL list -----
-if [[ -n $URL_LIST ]]; then
-  [[ -f $URL_LIST ]] || die "URL list not found: $URL_LIST"
-  info "Reading explicit bundle URLs from $URL_LIST"
+# ------------------------------------------------- 1. URL lists -------------
+read_url_list() {  # read_url_list <file> <repo_only 0|1>
+  local line
   while IFS= read -r line || [[ -n $line ]]; do
     line="${line%%#*}"; line="$(echo "$line" | xargs)"; [[ -z $line ]] && continue
+    if [[ $2 == 1 && ! $line =~ ^https://$REPO_HOST/ ]]; then
+      warn "Ignoring $line from the central list — only https://$REPO_HOST/ URLs are allowed there"; continue
+    fi
     add_candidate "$line"
-  done <"$URL_LIST"
+  done <"$1"
+}
+if [[ -n $KNOWN_LIST_URL ]]; then
+  if fetch "$KNOWN_LIST_URL" -q -T 20 -t 2 -O "$TMP_DIR/known.txt"; then
+    info "Reading central list of known bundles from $KNOWN_LIST_URL"
+    read_url_list "$TMP_DIR/known.txt" 1
+  else
+    warn "Couldn't fetch the central list ($KNOWN_LIST_URL) — continuing with discovery only"
+  fi
+fi
+if [[ -n $URL_LIST ]]; then
+  [[ -f $URL_LIST ]] || die "URL list not found: $URL_LIST"
+  info "Reading extra bundle URLs from $URL_LIST"
+  read_url_list "$URL_LIST" 0
 fi
 
 # ------------------------------------------------- 2. auto-discovery --------

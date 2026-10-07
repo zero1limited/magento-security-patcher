@@ -1,0 +1,13 @@
+# Known Magento security patch bundles, one URL per line (# comments allowed).
+# patcher.sh fetches this file on every run and applies any bundle that matches
+# the site's installed version, in release-date order.
+# Only https://repo.magento.com/ URLs are accepted from this file.
+# Filename format: <major>-<minor>-<patch>[-p<N>]-<mon>-<yyyy>.zip
+
+# --- Sep 2026 ---
+https://repo.magento.com/patch/2-4-9-sep-2026.zip
+https://repo.magento.com/patch/2-4-8-p5-sep-2026.zip
+https://repo.magento.com/patch/2-4-7-p10-sep-2026.zip
+https://repo.magento.com/patch/auth/2-4-6-p15-sep-2026.zip
+https://repo.magento.com/patch/auth/2-4-5-p17-sep-2026.zip
+https://repo.magento.com/patch/auth/2-4-4-p18-sep-2026.zip
