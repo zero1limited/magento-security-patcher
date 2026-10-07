@@ -11,3 +11,21 @@ https://repo.magento.com/patch/2-4-7-p10-sep-2026.zip
 https://repo.magento.com/patch/auth/2-4-6-p15-sep-2026.zip
 https://repo.magento.com/patch/auth/2-4-5-p17-sep-2026.zip
 https://repo.magento.com/patch/auth/2-4-4-p18-sep-2026.zip
+
+
+# --- Aug 2026 ---
+https://repo.magento.com/patch/2-4-9-aug-2026.zip
+https://repo.magento.com/patch/2-4-8-p5-aug-2026.zip
+https://repo.magento.com/patch/2-4-7-p10-aug-2026.zip
+https://repo.magento.com/patch/auth/2-4-6-p15-aug-2026.zip
+https://repo.magento.com/patch/auth/2-4-5-p17-aug-2026.zip
+https://repo.magento.com/patch/auth/2-4-4-p18-aug-2026.zip
+
+
+# --- Jul 2026 ---
+https://repo.magento.com/patch/2-4-9-jul-2026.zip
+https://repo.magento.com/patch/2-4-8-p5-jul-2026.zip
+https://repo.magento.com/patch/2-4-7-p10-jul-2026.zip
+https://repo.magento.com/patch/auth/2-4-6-p15-jul-2026.zip
+https://repo.magento.com/patch/auth/2-4-5-p17-jul-2026.zip
+https://repo.magento.com/patch/auth/2-4-4-p18-jul-2026.zip
