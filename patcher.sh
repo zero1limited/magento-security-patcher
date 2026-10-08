@@ -325,28 +325,131 @@ select_patch_files() {  # select_patch_files <dir>  → prints patch files, sort
 
 P() { patch -d "$MAGENTO_ROOT" -p1 -f --no-backup-if-mismatch "$@"; }
 
+# --------------------------------------------------- applicability check ----
+# Splits a unified diff into one file per target (sec/<n>.diff) and prints a
+# manifest line per target: "<n>\t<old path>\t<new path>" (paths with the a/ b/
+# prefix stripped, as -p1 does). Hunk line counts are tracked so content lines
+# that happen to start with "--- " or "+++ " are never mistaken for headers.
+PATCH_SPLIT_AWK='
+function strip(p) { sub(/\t.*$/, "", p); gsub(/^"|"$/, "", p); if (p == "/dev/null") return p; sub(/^[^\/]*\//, "", p); return p }
+function newsec() { n++; hasdiff = 0; hasold = 0 }
+function out(l) { if (n > 0) print l > (dir "/" n ".diff") }
+BEGIN { n = 0; inh = 0 }
+{
+  if (inh) {
+    c = substr($0, 1, 1)
+    if (c == " " || $0 == "") { ol--; nl-- } else if (c == "-") { ol-- } else if (c == "+") { nl-- } else if (c == "\\") { } else { inh = 0 }
+    if (inh) { out($0); if (ol <= 0 && nl <= 0) inh = 0; next }
+  }
+  if ($0 ~ /^diff /) {
+    newsec(); hasdiff = 1
+    if ($0 ~ /^diff --git /) { g = $0; sub(/^diff --git /, "", g); i = index(g, " b/")
+      if (i) { dgo[n] = strip(substr(g, 1, i - 1)); dgn[n] = strip(substr(g, i + 1)) } }
+    out($0); next
+  }
+  if ($0 ~ /^--- /)  { if (!(hasdiff && !hasold)) newsec(); old[n] = strip(substr($0, 5)); hasold = 1; out($0); next }
+  if ($0 ~ /^\+\+\+ /) { new[n] = strip(substr($0, 5)); out($0); next }
+  if ($0 ~ /^@@ /) {
+    h = $0; sub(/^@@ -/, "", h); split(h, parts, " ")
+    split(parts[1], A, ","); ol = (A[2] == "" ? 1 : A[2] + 0)
+    p2 = parts[2]; sub(/^\+/, "", p2); split(p2, B, ","); nl = (B[2] == "" ? 1 : B[2] + 0)
+    inh = (ol > 0 || nl > 0); out($0); next
+  }
+  out($0)
+}
+END { for (i = 1; i <= n; i++) { o = old[i]; w = new[i]; if (o == "") o = dgo[i]; if (w == "") w = dgn[i]; print i "\t" o "\t" w } }'
+
+pkg_root() {   # the installable unit a path belongs to
+  local p="$1"; local -a c; IFS=/ read -r -a c <<<"$p"
+  case "$p" in
+    vendor/*/*/*)        echo "vendor/${c[1]}/${c[2]}" ;;
+    app/code/*/*/*)      echo "app/code/${c[2]}/${c[3]}" ;;
+    app/design/*/*/*/*)  echo "app/design/${c[2]}/${c[3]}/${c[4]}" ;;
+    */*)                 echo "${p%/*}" ;;
+    *)                   echo "." ;;
+  esac
+}
+pkg_label() {  # vendor/magento/module-company -> magento/module-company
+  case "$1" in vendor/*) echo "${1#vendor/}" ;; app/code/*) local r="${1#app/code/}"; echo "${r/\//_}" ;; *) echo "$1" ;; esac
+}
+
+# assess_patch <patch file> <work dir>
+# Sets: AP_STATUS (ok|partial|na|missing), AP_FILE (patch to apply: original or
+# filtered), AP_TOTAL, AP_OK, AP_NA_PKGS, AP_MISSING (newline-separated details)
+assess_patch() {
+  local f="$1" work="$2" idx old new target root
+  local -a keep=() ; local -A na_pkgs=()
+  rm -rf "$work"; mkdir -p "$work/sec"
+  AP_TOTAL=0; AP_OK=0; AP_MISSING=""; AP_NA_PKGS=""; AP_FILE="$f"
+  while IFS=$'\t' read -r idx old new; do
+    [[ -z $idx ]] && continue
+    AP_TOTAL=$((AP_TOTAL + 1))
+    target="$old"; [[ $old == /dev/null || -z $old ]] && target="$new"
+    if [[ -z $target || $target == /dev/null || $target == /* || /$target/ == */../* ]]; then
+      AP_MISSING+="unsafe or unreadable path in header: '${old:-?}' -> '${new:-?}'"$'\n'; continue
+    fi
+    root="$(pkg_root "$target")"
+    if [[ $old == /dev/null ]]; then                       # patch creates a new file
+      if [[ -e $MAGENTO_ROOT/$target || -d $MAGENTO_ROOT/$root ]]; then keep+=("$idx"); else na_pkgs[$(pkg_label "$root")]=1; fi
+    elif [[ -e $MAGENTO_ROOT/$target ]]; then              # modifies / deletes an existing file
+      keep+=("$idx")
+    elif [[ -d $MAGENTO_ROOT/$root ]]; then                # package installed but file missing: real problem
+      AP_MISSING+="$target (package $(pkg_label "$root") is installed but this file is missing)"$'\n'
+    else
+      na_pkgs[$(pkg_label "$root")]=1
+    fi
+  done < <(awk -v dir="$work/sec" "$PATCH_SPLIT_AWK" "$f")
+  AP_OK=${#keep[@]}
+  AP_NA_PKGS="$(printf '%s\n' "${!na_pkgs[@]}" | grep -v '^$' | sort | paste -sd, - | sed 's/,/, /g')"
+  if (( AP_TOTAL == 0 )); then AP_STATUS=missing; AP_MISSING+="no file headers (--- / +++) found"$'\n'
+  elif [[ -n $AP_MISSING ]]; then AP_STATUS=missing
+  elif (( AP_OK == 0 )); then AP_STATUS=na
+  elif (( AP_OK < AP_TOTAL )); then
+    AP_STATUS=partial; AP_FILE="$work/applicable.patch"
+    for idx in "${keep[@]}"; do cat "$work/sec/$idx.diff"; done >"$AP_FILE"
+  else AP_STATUS=ok; fi
+}
+
 apply_bundle() {  # apply_bundle <name> <dir>  — all-or-nothing
-  local name="$1" dir="$2" f out; local -a files=() done_files=()
+  local name="$1" dir="$2" f out n=0; local -a files=() done_files=()
   mapfile -t files < <(select_patch_files "$dir")
   if [[ ${#files[@]} -eq 0 ]]; then alert "Empty bundle" "$name contains no .patch/.diff files"; return 3; fi
   info "$name: ${#files[@]} patch file(s)"
-  APPLIED_COUNT=0; SKIPPED_COUNT=0
+  APPLIED_COUNT=0; SKIPPED_COUNT=0; NA_COUNT=0
+  rollback() {
+    if (( ${#done_files[@]} )); then
+      warn "  Rolling back ${#done_files[@]} patch(es) already applied from $name"
+      for (( i=${#done_files[@]}-1; i>=0; i-- )); do P -R -s <"${done_files[$i]}" || warn "  rollback failed: ${done_files[$i]}"; done
+    fi
+  }
   for f in "${files[@]}"; do
-    local rel="${f#"$dir"/}"
-    if P -R --dry-run -s <"$f" >/dev/null 2>&1; then
+    local rel="${f#"$dir"/}"; n=$((n + 1))
+    assess_patch "$f" "$TMP_DIR/assess/$n"
+    case "$AP_STATUS" in
+      na)
+        info "  - $rel: NOT APPLICABLE — targets packages not installed here: $AP_NA_PKGS"
+        NA_COUNT=$((NA_COUNT + 1)); continue ;;
+      missing)
+        log ERROR "  x $rel: targets files that should exist but don't:"
+        printf '%s' "$AP_MISSING" | sed 's/^/      /' | tee -a "$RUN_LOG" >&2
+        rollback
+        alert "Patch target missing" "$rel in $name targets files missing from installed packages (wrong version, or files removed/overridden?). Bundle rolled back; later bundles NOT applied."
+        return 3 ;;
+      partial)
+        info "  ! $rel: $AP_OK of $AP_TOTAL files apply; skipping the rest — not installed here: $AP_NA_PKGS" ;;
+    esac
+    if P -R --dry-run -s <"$AP_FILE" >/dev/null 2>&1; then
       info "  = $rel (already applied)"; SKIPPED_COUNT=$((SKIPPED_COUNT + 1)); continue
     fi
-    if ! out="$(P --dry-run <"$f" 2>&1)"; then
+    if ! out="$(P --dry-run <"$AP_FILE" 2>&1)"; then
       log ERROR "  x $rel will not apply cleanly:"; printf '%s\n' "$out" | sed 's/^/      /' | tee -a "$RUN_LOG" >&2
-      if (( ${#done_files[@]} )); then
-        warn "  Rolling back ${#done_files[@]} patch(es) already applied from $name"
-        for (( i=${#done_files[@]}-1; i>=0; i-- )); do P -R -s <"${done_files[$i]}" || warn "  rollback failed: ${done_files[$i]}"; done
-      fi
+      rollback
       alert "Patch conflict" "$rel in $name does not apply to $INSTALLED (core files modified, or a vendor override?). Bundle rolled back; later bundles NOT applied."
       return 3
     fi
     if (( DRY_RUN )); then info "  ~ $rel (would apply)"; else
-      P -s <"$f"; info "  + $rel"; done_files+=("$f"); fi
+      P -s <"$AP_FILE"; info "  + $rel"
+      cp "$AP_FILE" "$TMP_DIR/assess/$n.applied"; done_files+=("$TMP_DIR/assess/$n.applied"); fi
     APPLIED_COUNT=$((APPLIED_COUNT + 1))
   done
   return 0
@@ -386,10 +489,10 @@ for ym in $MONTHS; do
   if apply_bundle "$name" "$dir"; then
     STAMP="$(date '+%F %T %Z')"
     if (( DRY_RUN )); then
-      SUMMARY+=("DRY-RUN  $REL  $name  — $APPLIED_COUNT would apply, $SKIPPED_COUNT already present")
+      SUMMARY+=("DRY-RUN  $REL  $name  — $APPLIED_COUNT would apply, $SKIPPED_COUNT already present, $NA_COUNT not applicable")
     else
-      echo "$name|$BASE-p$p|$ym|$REL|$STAMP|$SHA|$APPLIED_COUNT/$SKIPPED_COUNT" >>"$APPLIED_LOG"
-      SUMMARY+=("APPLIED  $REL  $name  — released $REL, applied $STAMP ($APPLIED_COUNT new, $SKIPPED_COUNT already present)")
+      echo "$name|$BASE-p$p|$ym|$REL|$STAMP|$SHA|$APPLIED_COUNT/$SKIPPED_COUNT/$NA_COUNT" >>"$APPLIED_LOG"
+      SUMMARY+=("APPLIED  $REL  $name  — released $REL, applied $STAMP ($APPLIED_COUNT new, $SKIPPED_COUNT already present, $NA_COUNT not applicable)")
       (( APPLIED_COUNT > 0 )) && ANY_APPLIED=1
       ok "$REL bundle applied ($name)"
     fi

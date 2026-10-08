@@ -31,9 +31,13 @@ Always keep the `-f` in `curl -fsSL`. Without it, a 404 or GitHub error page get
    - It reads the [list of known bundles](patches.txt) in this repo on every run.
    - It checks `https://repo.magento.com/patch/` and `https://repo.magento.com/patch/auth/` for files named like `2-4-7-p10-sep-2026.zip`, for every month from the last bundle it applied up to next month (the last 6 months on the first run). That's how next month's bundle gets picked up automatically, even before it's added to the list.
 3. **Applies them in date order.** Each bundle is unpacked and all of its `.patch`/`.diff` files are applied with `patch -p1` from the Magento root. Where Adobe ships both a composer-format and a git-format version of a patch, it picks the one that matches how Magento is installed.
-4. **Rolls back on failure.** If any patch in a bundle won't apply cleanly, the patches already applied from that bundle are undone, an alert is raised, and no later bundles are attempted.
-5. **Stops if the site needs upgrading.** If a bundle needs a higher patch level than is installed (for example the bundle is for `2.4.7-p10` and the site is on `2.4.7-p9`), it raises an alert saying which version to upgrade to and applies nothing from that point on.
-6. **Records what it did.** It flushes the cache and writes each bundle's release month and the time it was applied to `var/security-patches/applied.log`.
+4. **Checks every patch applies to this site.** Before applying anything, it reads the `---`/`+++` file headers in each patch and checks each target file against the install:
+   - **Target exists:** the change is applied.
+   - **Whole package not installed** (for example a B2B patch for `magento/module-company` on a CE site): reported as **Not Applicable** and skipped. If only some files in a patch are N/A, the rest of that patch is still applied.
+   - **Package installed but the file is missing:** treated as an error, because it means the version doesn't match or core files have been removed or overridden. An alert is raised and the bundle is rolled back.
+5. **Rolls back on failure.** If any patch in a bundle won't apply cleanly, the patches already applied from that bundle are undone, an alert is raised, and no later bundles are attempted.
+6. **Stops if the site needs upgrading.** If a bundle needs a higher patch level than is installed (for example the bundle is for `2.4.7-p10` and the site is on `2.4.7-p9`), it raises an alert saying which version to upgrade to and applies nothing from that point on.
+7. **Records what it did.** It flushes the cache and writes each bundle's release month and the time it was applied to `var/security-patches/applied.log`.
 
 Running it again is safe. Bundles and patches that are already in place are detected and skipped, including ones applied by hand.
 
@@ -61,7 +65,7 @@ Running it again is safe. Bundles and patches that are already in place are dete
 | 0 | Success, or nothing to do |
 | 1 | Error (download, auth, environment) |
 | 2 | Upgrade required before the next bundle can be applied |
-| 3 | A patch wouldn't apply cleanly; that bundle was rolled back |
+| 3 | A patch wouldn't apply cleanly, or targets a file missing from an installed package; that bundle was rolled back |
 
 ## Adding new bundles
 
