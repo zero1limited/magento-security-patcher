@@ -47,7 +47,7 @@ Always keep the `-f` in `curl -fsSL`. Without it, a 404 or GitHub error page get
    - If no registry patch applies to your version at all, it raises an **unsupported-version alert**.
    - Everything applied is written to `var/security-patches/applied.log`.
 
-Running it again is safe and quick, because applied patches are recorded and skipped. When Adobe adds a new month to the registry, the next run picks it up automatically.
+Running it again is safe. **Every run checks the actual files; it never trusts the history.** `vendor/` is often rebuilt by `composer install` or a deploy while `var/` survives, so a patch recorded in `applied.log` is still checked against the code. If its changes have gone, it's re-applied and reported as `RE-APPLIED`. Checks are done file by file and are chain-aware: a file changed by July and then again by August counts as in place for July when August's change sits on top of it. A patch that's half in place (e.g. its `vendor/` files reverted but its `lib/` or `pub/` files still patched) only has its missing files applied. When Adobe adds a new month to the registry, the next run picks it up automatically.
 
 ## Dry run
 

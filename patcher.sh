@@ -396,7 +396,7 @@ pkg_root() {   # the installable unit a path belongs to
   esac
 }
 pkg_label() {  # vendor/magento/module-company -> magento/module-company
-  case "$1" in vendor/*) echo "${1#vendor/}" ;; app/code/*) local r="${1#app/code/}"; echo "${r/\//_}" ;; *) echo "$1" ;; esac
+  case "$1" in vendor/bin) echo "the Composer bin directory (vendor/bin)" ;; vendor/*) echo "${1#vendor/}" ;; app/code/*) local r="${1#app/code/}"; echo "${r/\//_}" ;; *) echo "$1" ;; esac
 }
 
 # Dry runs apply everything for real to a scratch copy of just the files the
@@ -417,12 +417,13 @@ shadow_prepare() {  # copy targets into the scratch copy the first time they're 
 
 # assess_patch <patch file> <work dir>
 # Sets: AP_STATUS (ok|partial|na|missing), AP_FILE (patch to apply: original or
-# filtered), AP_TOTAL, AP_OK, AP_NA_PKGS, AP_MISSING, AP_TARGETS (kept targets)
+# filtered), AP_TOTAL, AP_OK, AP_NA_PKGS, AP_MISSING, AP_TARGETS (kept targets),
+# AP_SECS (one diff per kept target file, same order as AP_TARGETS)
 assess_patch() {
   local f="$1" work="$2" idx old new target root
   local -a keep=(); local -A na_pkgs=()
   rm -rf "$work"; mkdir -p "$work/sec"
-  AP_TOTAL=0; AP_OK=0; AP_MISSING=""; AP_NA_PKGS=""; AP_FILE="$f"; AP_TARGETS=()
+  AP_TOTAL=0; AP_OK=0; AP_MISSING=""; AP_NA_PKGS=""; AP_FILE="$f"; AP_TARGETS=(); AP_SECS=()
   while IFS=$'\t' read -r idx old new; do
     [[ -z $idx ]] && continue
     AP_TOTAL=$((AP_TOTAL + 1))
@@ -432,11 +433,11 @@ assess_patch() {
     fi
     root="$(pkg_root "$target")"
     if [[ $old == /dev/null ]]; then                       # patch creates a new file
-      if t_exists "$target" || d_exists "$root"; then keep+=("$idx"); AP_TARGETS+=("$target"); else na_pkgs[$(pkg_label "$root")]=1; fi
+      if t_exists "$target" || d_exists "$root"; then keep+=("$idx"); AP_TARGETS+=("$target"); AP_SECS+=("$work/sec/$idx.diff"); else na_pkgs[$(pkg_label "$root")]=1; fi
     elif t_exists "$target"; then                          # modifies / deletes an existing file
-      keep+=("$idx"); AP_TARGETS+=("$target")
+      keep+=("$idx"); AP_TARGETS+=("$target"); AP_SECS+=("$work/sec/$idx.diff")
     elif d_exists "$root"; then                            # package installed but file missing: real problem
-      AP_MISSING+="$target (package $(pkg_label "$root") is installed but this file is missing)"$'\n'
+      AP_MISSING+="$target ($(pkg_label "$root") exists but this file is missing — was it removed, or never created by an earlier patch?)"$'\n'
     else
       na_pkgs[$(pkg_label "$root")]=1
     fi
@@ -454,6 +455,22 @@ assess_patch() {
 
 # Same strictness as Adobe's own vendor/bin/patch-status tool: no fuzz, never prompt
 P() { patch -d "$APPLY_ROOT" -p1 --fuzz=0 --batch --forward --no-backup-if-mismatch "$@"; }
+
+# in_place_under_later <target> <section>: is this patch's change to <target> still there,
+# underneath changes that later patches in the chain made to the same file? Peels those later
+# changes off a scratch copy (newest first), then reverse-checks this patch's section.
+in_place_under_later() {
+  local tgt="$1" sec="$2" peel="$TMP_DIR/peel" lpos lsec src
+  local -a Q=(-d "$peel" -p1 --fuzz=0 --batch --forward --no-backup-if-mismatch -R -s)
+  awk -F'\t' -v f="$tgt" -v k="$CUR_POS" '$1==f && $2+0>k+0' "$SECINDEX" | grep -q . || return 1
+  rm -rf "$peel"; mkdir -p "$peel"
+  if (( DRY_RUN )) && [[ -n ${SHADOW[$tgt]:-} ]]; then src="$APPLY_ROOT/$tgt"; else src="$MAGENTO_ROOT/$tgt"; fi
+  if [[ -e $src ]]; then mkdir -p "$peel/$(dirname "$tgt")"; cp -p "$src" "$peel/$tgt"; fi
+  while IFS=$'\t' read -r lpos lsec; do
+    if patch "${Q[@]}" --dry-run <"$lsec" >/dev/null 2>&1; then patch "${Q[@]}" <"$lsec" >/dev/null 2>&1 || true; fi
+  done < <(awk -F'\t' -v f="$tgt" -v k="$CUR_POS" '$1==f && $2+0>k+0 {print $2"\t"$3}' "$SECINDEX" | sort -t$'\t' -k1,1nr)
+  patch "${Q[@]}" --dry-run <"$sec" >/dev/null 2>&1
+}
 
 # apply_unit <id> <patch files...>  — all-or-nothing; sets UNIT_RESULT (applied|already|na) + counts
 apply_unit() {
@@ -479,17 +496,28 @@ apply_unit() {
         info "    ! $rel: $AP_OK of $AP_TOTAL files apply; skipping the rest — not installed here: $AP_NA_PKGS"
         U_NOTE="partly N/A: $AP_NA_PKGS" ;;
     esac
+    # Checked file by file: after a vendor/ rebuild a patch can be half in place (e.g. its
+    # vendor/ files reverted but lib/ or pub/ files still patched). Files already patched are
+    # skipped, the rest applied; any file that is neither -> roll back the whole patch.
     shadow_prepare "${AP_TARGETS[@]}"
-    if P -R --dry-run -s <"$AP_FILE" >/dev/null 2>&1; then
+    local i sec tgt n_done=0 n_have=0
+    for (( i=0; i<${#AP_SECS[@]}; i++ )); do
+      sec="${AP_SECS[$i]}"; tgt="${AP_TARGETS[$i]}"
+      if P -R --dry-run -s <"$sec" >/dev/null 2>&1; then n_have=$((n_have + 1)); continue; fi
+      if ! out="$(P --dry-run <"$sec" 2>&1)"; then
+        if in_place_under_later "$tgt" "$sec"; then n_have=$((n_have + 1)); continue; fi   # since changed by a later patch
+        log ERROR "    x $rel: $tgt is neither patched nor patchable:"; printf '%s\n' "$out" | sed 's/^/        /' | tee -a "$RUN_LOG" >&2
+        rollback; U_NOTE="$tgt does not apply cleanly (modified core file or a vendor override?)"; return 3
+      fi
+      P -s <"$sec"; cp "$sec" "$sec.applied"; done_files+=("$sec.applied"); n_done=$((n_done + 1))
+    done
+    if (( n_done == 0 )); then
       info "    = $rel (already applied)"; U_ALREADY=$((U_ALREADY + 1)); continue
     fi
-    if ! out="$(P --dry-run <"$AP_FILE" 2>&1)"; then
-      log ERROR "    x $rel will not apply cleanly:"; printf '%s\n' "$out" | sed 's/^/        /' | tee -a "$RUN_LOG" >&2
-      rollback; U_NOTE="does not apply cleanly (modified core files or a vendor override?)"; return 3
-    fi
-    P -s <"$AP_FILE"
-    cp "$AP_FILE" "$TMP_DIR/assess/$id/$n.applied"; done_files+=("$TMP_DIR/assess/$id/$n.applied")
-    if (( DRY_RUN )); then info "    ~ $rel (would apply)"; else info "    + $rel"; fi
+    if (( n_have > 0 )); then
+      info "    ~ $rel: $n_have of $((n_have + n_done)) files were already patched; $( (( DRY_RUN )) && echo 'would apply' || echo applied) the other $n_done"
+      U_NOTE="${U_NOTE:+$U_NOTE; }$n_have of $((n_have + n_done)) files were already patched"
+    elif (( DRY_RUN )); then info "    ~ $rel (would apply)"; else info "    + $rel"; fi
     U_NEW=$((U_NEW + 1))
   done
   if   (( U_NEW > 0 )); then UNIT_RESULT=applied
@@ -508,8 +536,42 @@ for line in "${SKIPS[@]}"; do
   FAILED[$id]=blocked; warn "Blocked: $id — $why"; row BLOCKED "$rel" "$id" "— $why"
 done
 
+# ---------------------------------------- download + verify everything first ----
+# Every planned patch is fetched (and sha256-checked) before anything is applied: deciding
+# whether a file is already patched needs to see the later patches in the chain that touch
+# the same file (e.g. July creates vendor/bin/patch-status, August then modifies it).
+declare -A DL_WHY=()
+SECINDEX="$TMP_DIR/secindex.tsv"; : >"$SECINDEX"
+pos=0
 for line in "${PLAN[@]}"; do
   IFS=$'\t' read -r id area ver file sha rel reqs recorded ncve entitled <<<"$line"
+  dest="$DL_DIR/$file"; url="$BASE_URL/$file"   # exactly as the registry says; the server redirects entitled patches itself
+  if [[ ! -s $dest || "$(sha256 "$dest")" != "$sha" ]]; then
+    rm -f "$dest" "$dest.part"
+    if ! fetch "$url" -q -T 60 -t 3 -O "$dest.part"; then
+      rm -f "$dest.part"; code="$(http_status "$url")"
+      if [[ $code == 401 || $code == 403 ]]; then
+        if [[ -n $CRED_RC ]]; then why="repo.magento.com keys were rejected — check they carry the required entitlement (HTTP $code)"
+        else why="needs repo.magento.com keys with the required entitlement (HTTP $code)"; fi
+      else why="download failed (HTTP ${code:-?})"; fi
+      DL_WHY[$id]="download|$why"; pos=$((pos + 1)); continue
+    fi
+    mv "$dest.part" "$dest"
+  fi
+  got="$(sha256 "$dest")"
+  if [[ $got != "$sha" ]]; then rm -f "$dest"; DL_WHY[$id]="hash|$got"; pos=$((pos + 1)); continue; fi
+  sd="$TMP_DIR/split/$id"; mkdir -p "$sd"
+  while IFS=$'\t' read -r idx o w; do
+    t="$o"; if [[ $o == /dev/null || -z $o ]]; then t="$w"; fi
+    if [[ -n $t && $t != /dev/null ]]; then printf '%s\t%s\t%s\n' "$t" "$pos" "$sd/$idx.diff" >>"$SECINDEX"; fi
+  done < <(awk -v dir="$sd" "$PATCH_SPLIT_AWK" "$dest")
+  pos=$((pos + 1))
+done
+
+pos=0
+for line in "${PLAN[@]}"; do
+  IFS=$'\t' read -r id area ver file sha rel reqs recorded ncve entitled <<<"$line"
+  CUR_POS=$pos; pos=$((pos + 1))
   label="$area $ver, $ncve CVE$([[ $ncve == 1 ]] || echo s)"
   info "${C_B}$id${C_0}  ($label, released $rel)"
 
@@ -523,42 +585,40 @@ for line in "${PLAN[@]}"; do
     FAILED[$id]=blocked; warn "  Skipped — requires $blocker, which failed"; row SKIPPED "$rel" "$id" "— requires $blocker, which failed"; continue
   fi
 
-  if [[ $recorded == "$sha" ]]; then
-    info "  already recorded as applied"; continue
-  elif [[ $recorded != - ]]; then
+  # applied.log is a record, never a reason to skip: vendor/ can be rebuilt (composer install,
+  # deploys) while var/ survives, so every recorded patch is re-verified against the files.
+  if [[ $recorded != - && $recorded != "$sha" ]]; then
     warn "  registry sha256 changed since this patch was recorded — re-checking"
   fi
 
-  # download + integrity
   dest="$DL_DIR/$file"
-  url="$BASE_URL/$file"   # exactly as the registry says; the server redirects entitled patches itself
-  if [[ ! -s $dest || "$(sha256 "$dest")" != "$sha" ]]; then
-    rm -f "$dest" "$dest.part"
-    if ! fetch "$url" -q -T 60 -t 3 -O "$dest.part"; then
-      rm -f "$dest.part"; code="$(http_status "$url")"
-      if [[ $code == 401 || $code == 403 ]]; then
-        if [[ -n $CRED_RC ]]; then why="repo.magento.com keys were rejected — check they carry the required entitlement (HTTP $code)"
-        else why="needs repo.magento.com keys with the required entitlement (HTTP $code)"; fi
-      else why="download failed (HTTP ${code:-?})"; fi
-      FAILED[$id]=download; alert "Patch download failed" "$id: $why — $url"; row FAILED "$rel" "$id" "— $why"; RC=3; continue
+  if [[ -n ${DL_WHY[$id]:-} ]]; then
+    why="${DL_WHY[$id]#*|}"
+    if [[ ${DL_WHY[$id]%%|*} == hash ]]; then
+      FAILED[$id]=hash; alert "Integrity check failed" "$id: sha256 $why does not match the registry ($sha). File deleted, NOT applied."
+      row FAILED "$rel" "$id" "— sha256 mismatch (not applied)"
+    else
+      FAILED[$id]=download; alert "Patch download failed" "$id: $why — $BASE_URL/$file"; row FAILED "$rel" "$id" "— $why"
     fi
-    mv "$dest.part" "$dest"
-  fi
-  got="$(sha256 "$dest")"
-  if [[ $got != "$sha" ]]; then
-    rm -f "$dest"; FAILED[$id]=hash
-    alert "Integrity check failed" "$id: sha256 $got does not match the registry ($sha). File deleted, NOT applied."
-    row FAILED "$rel" "$id" "— sha256 mismatch (not applied)"; RC=3; continue
+    RC=3; continue
   fi
   info "  sha256 verified"
 
   if apply_unit "$id" "$dest"; then
     stamp="$(date '+%F %T %Z')"
+    if [[ $recorded == "$sha" && $UNIT_RESULT != applied ]]; then
+      info "  verified: still in place"; continue          # recorded and present: nothing to report
+    fi
     case "$UNIT_RESULT" in
       applied) what="$([[ $DRY_RUN == 1 ]] && echo WOULD-APPLY || echo APPLIED)"; ANY_APPLIED=1 ;;
       already) what=ALREADY ;;
       na)      what=N/A ;;
     esac
+    if [[ $recorded == "$sha" ]]; then                   # recorded, but the changes had gone
+      what="$([[ $DRY_RUN == 1 ]] && echo WOULD-REAPPLY || echo RE-APPLIED)"
+      U_NOTE="recorded as applied but no longer in place (vendor/ rebuilt?)${U_NOTE:+; $U_NOTE}"
+      warn "  $id was recorded as applied but its changes are no longer in place (vendor/ rebuilt by composer install or a deploy?) — re-applying"
+    fi
     row "$what" "$rel" "$id" "($label)${U_NOTE:+ — $U_NOTE}"
     if (( ! DRY_RUN )); then
       echo "R|$id|$area|$ver|$rel|$stamp|$sha|$UNIT_RESULT" >>"$APPLIED_LOG"
