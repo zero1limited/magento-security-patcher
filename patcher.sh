@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  magento-security-patcher.sh  —  ZERO-1
+#  patcher.sh  —  ZERO-1 Magento security patcher
+#  https://github.com/zero1limited/magento-security-patcher
 #
-#  One command to:
-#    1. Detect the installed Magento version (bin/magento -V, falling back to
-#       composer.lock / composer.json)
-#    2. Discover monthly security patch bundles on repo.magento.com
-#       (e.g. https://repo.magento.com/patch/2-4-7-p10-sep-2026.zip), plus any
-#       explicit URLs in a list file
-#    3. Download + unpack them, then apply every patch inside, strictly in
-#       release-date order, transactionally per bundle
-#    4. Alert (stderr / Slack-compatible webhook / email) if a bundle needs a
-#       higher patch level than is installed, or if a patch will not apply
+#  One command to bring a Magento / Adobe Commerce install up to date with
+#  Adobe's isolated security patches, driven by the official registry:
+#    https://repo.magento.com/patch/patch-registry.json
 #
-#  Re-runnable / cron-safe: already-applied bundles and patches are detected
-#  and skipped, so each run just picks up whatever is new (e.g. next month).
+#    1. Detects the installed version of every registry "area" (CE core
+#       version, plus EE / B2B / PageBuilder / ... from composer packages)
+#    2. Selects every registry patch whose applies_to matches what's installed
+#    3. Orders them by their "requires" chain (then release date) and refuses
+#       any patch whose prerequisites can't be met
+#    4. Downloads each .diff, verifies its sha256 against the registry, checks
+#       every target file exists (reports Not Applicable otherwise), then
+#       applies it — skipping anything already applied
+#    5. Alerts (stderr / Slack-style webhook / email) when newer patches exist
+#       for a higher patch level, or anything fails
 #
-#  Usage:   ./magento-security-patcher.sh [options]
-#  Run with -h for options. Requires: bash 4+, GNU date, wget, unzip, patch, php
+#  Usage:  curl -fsSL <raw-url>/patcher.sh | bash -s -- [options]
+#          ./patcher.sh [options]          (run with -h for options)
+#  Needs:  bash 4+, GNU date, wget, patch, php, awk, sha256sum/shasum
 #
-#  Exit codes: 0 ok / nothing to do, 1 error, 2 upgrade required,
-#              3 patch conflict (bundle rolled back)
+#  Exit codes: 0 up to date, 1 error, 2 newer patches need a version upgrade,
+#              3 a patch failed (conflict / missing file / download / hash)
 # =============================================================================
+
 # Everything runs inside main(), which is only called on the last line. When the
 # script is piped (curl ... | bash) this means a truncated download runs nothing,
 # and no command inside can read the rest of the script from stdin.
@@ -31,15 +35,7 @@ export LC_ALL=C
 
 # ---------------------------------------------------------------- defaults ---
 MAGENTO_ROOT="${MAGENTO_ROOT:-$(pwd)}"
-# Space-separated list of base locations probed for <ver>-p<N>-<mon>-<yyyy>.zip
-PATCH_BASE_URLS="${PATCH_BASE_URLS:-https://repo.magento.com/patch https://repo.magento.com/patch/auth}"
-URL_LIST="${URL_LIST:-}"                  # optional local file: one zip URL per line
-# Central list of known bundles, maintained in the GitHub repo and fetched on every run.
-# Only repo.magento.com URLs are accepted from it.
-KNOWN_LIST_URL="${KNOWN_LIST_URL-https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patches.txt}"
-LOOKBACK_MONTHS="${LOOKBACK_MONTHS:-6}"   # discovery window when no history
-LOOKAHEAD_MONTHS="${LOOKAHEAD_MONTHS:-1}" # also probe next month(s)
-P_AHEAD="${P_AHEAD:-3}"                   # probe up to N patch levels above installed
+REGISTRY="${REGISTRY:-https://repo.magento.com/patch/patch-registry.json}"  # URL or local file
 STATE_DIR="${STATE_DIR:-}"                # default: $MAGENTO_ROOT/var/security-patches
 ALERT_WEBHOOK="${ALERT_WEBHOOK:-}"        # Slack/Teams-style incoming webhook
 ALERT_EMAIL="${ALERT_EMAIL:-}"            # needs a working `mail` command
@@ -49,40 +45,30 @@ DI_COMPILE=0
 
 usage() {
   cat <<EOF
-Usage: magento-security-patcher.sh [options]
-       curl -fsSL <raw-url> | bash -s -- [options]
+Usage: patcher.sh [options]
+       curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patcher.sh | bash -s -- [options]
 
   -r, --root DIR          Magento root (default: current directory)
-  -l, --list FILE         Local file of extra patch zip URLs (one per line, # comments ok)
-      --known-list URL    Central list of known bundles (default: patches.txt in the GitHub repo)
-      --no-known-list     Don't fetch the central list
-  -b, --base-url URL      Base URL to probe (repeatable; default repo.magento.com/patch)
-      --lookback N        Months to look back when no history exists (default $LOOKBACK_MONTHS)
-      --lookahead N       Months ahead of today to probe (default $LOOKAHEAD_MONTHS)
-  -n, --dry-run           Download and test patches, change nothing
+      --registry URL|FILE Patch registry (default: $REGISTRY)
+  -n, --dry-run           Download, verify and test every patch against a scratch copy; change nothing
       --no-cache-flush    Skip bin/magento cache:flush after applying
       --compile           Run bin/magento setup:di:compile after applying
-      --webhook URL       Post alerts to this webhook
-      --email ADDR        Email alerts to this address
+      --webhook URL       Post alerts to this webhook (not sent on dry runs)
+      --email ADDR        Email alerts to this address (not sent on dry runs)
   -h, --help              Show this help
 
-Credentials for repo.magento.com are read from (first found):
+Credentials for repo.magento.com (only needed for patches with entitlements,
+e.g. extended-support versions) are read from the first found of:
   \$MAGENTO_REPO_USER / \$MAGENTO_REPO_PASS, <root>/auth.json,
   \$COMPOSER_HOME/auth.json, ~/.config/composer/auth.json, ~/.composer/auth.json
 They are only ever sent to repo.magento.com.
 EOF
 }
 
-CLI_BASES=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--root)        MAGENTO_ROOT="$2"; shift 2 ;;
-    -l|--list)        URL_LIST="$2"; shift 2 ;;
-    --known-list)     KNOWN_LIST_URL="$2"; shift 2 ;;
-    --no-known-list)  KNOWN_LIST_URL=""; shift ;;
-    -b|--base-url)    CLI_BASES+=("${2%/}"); shift 2 ;;
-    --lookback)       LOOKBACK_MONTHS="$2"; shift 2 ;;
-    --lookahead)      LOOKAHEAD_MONTHS="$2"; shift 2 ;;
+    --registry)       REGISTRY="$2"; shift 2 ;;
     -n|--dry-run)     DRY_RUN=1; shift ;;
     --no-cache-flush) CACHE_FLUSH=0; shift ;;
     --compile)        DI_COMPILE=1; shift ;;
@@ -92,15 +78,13 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
-[[ ${#CLI_BASES[@]} -gt 0 ]] && PATCH_BASE_URLS="${CLI_BASES[*]}"
 
 MAGENTO_ROOT="$(cd "$MAGENTO_ROOT" && pwd)"
 STATE_DIR="${STATE_DIR:-$MAGENTO_ROOT/var/security-patches}"
 DL_DIR="$STATE_DIR/downloads"
-EX_DIR="$STATE_DIR/extracted"
 APPLIED_LOG="$STATE_DIR/applied.log"
 RUN_LOG="$STATE_DIR/run.log"
-mkdir -p "$DL_DIR" "$EX_DIR"
+mkdir -p "$DL_DIR"
 touch "$APPLIED_LOG"
 
 # ----------------------------------------------------------------- logging ---
@@ -119,6 +103,10 @@ json_str() { php -r 'echo json_encode($argv[1]);' "$1"; }
 
 alert() {   # alert "<subject>" "<body>"
   log ALERT "$1 — $2"
+  if (( DRY_RUN )); then
+    [[ -n $ALERT_WEBHOOK || -n $ALERT_EMAIL ]] && info "(dry run — alert not sent to webhook/email)"
+    return 0
+  fi
   local host; host="$(hostname 2>/dev/null || echo unknown)"
   local text="[Magento patcher @ $host:$MAGENTO_ROOT] $1: $2"
   if [[ -n $ALERT_WEBHOOK ]]; then
@@ -134,10 +122,12 @@ alert() {   # alert "<subject>" "<body>"
 }
 
 # ------------------------------------------------------------ preflight -----
-for bin in wget unzip patch php date sha256sum; do
+for bin in wget patch php awk date; do
   command -v "$bin" >/dev/null || die "Required command not found: $bin"
 done
-date -d '2000-01-01 +1 month' +%Y-%m >/dev/null 2>&1 || die "GNU date is required"
+if command -v sha256sum >/dev/null; then sha256() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null; then sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else die "Required command not found: sha256sum (or shasum)"; fi
 [[ -f "$MAGENTO_ROOT/composer.json" ]] || die "No composer.json in $MAGENTO_ROOT — is this a Magento root?"
 
 if command -v flock >/dev/null; then
@@ -163,7 +153,7 @@ if [[ -f "$MAGENTO_ROOT/bin/magento" ]]; then
 fi
 V_LOCK=""
 [[ -f "$MAGENTO_ROOT/composer.lock" ]] && V_LOCK="$(php_json "$MAGENTO_ROOT/composer.lock" \
-  'foreach(($j["packages"]??[]) as $p){ if(preg_match("#^magento/product-(community|enterprise)-edition$#",$p["name"])){ echo $p["version"]; break; } }')"
+  'foreach(($j["packages"]??[]) as $p){ if(preg_match("#^magento/product-(community|enterprise)-edition$#",$p["name"])){ echo ltrim($p["version"],"v"); break; } }')"
 V_JSON="$(php_json "$MAGENTO_ROOT/composer.json" \
   'echo $j["require"]["magento/product-enterprise-edition"] ?? $j["require"]["magento/product-community-edition"] ?? "";')"
 V_JSON="${V_JSON#[=^~v]}"
@@ -174,13 +164,7 @@ info "Detected Magento $INSTALLED  (bin/magento: ${V_CLI:-n/a} | composer.lock: 
 if [[ -n $V_JSON && $V_JSON =~ ^[0-9] && $V_JSON != "$INSTALLED" ]]; then
   warn "composer.json requires $V_JSON but $INSTALLED is installed — has a composer update been left unfinished?"
 fi
-
-[[ $INSTALLED =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-p([0-9]+)(\.[0-9]+)?)?$ ]] \
-  || die "Unrecognised version string: $INSTALLED"
-BASE="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
-PLEVEL="${BASH_REMATCH[5]:-0}"
-BASE_DASH="${BASE//./-}"
-info "Version line $BASE, patch level p$PLEVEL — looking for bundles named ${BASE_DASH}-p<N>-<mon>-<yyyy>.zip"
+[[ $INSTALLED =~ ^[0-9]+\.[0-9]+\.[0-9]+(-p[0-9]+(\.[0-9]+)?)?$ ]] || die "Unrecognised version string: $INSTALLED"
 
 # ------------------------------------------------------------ credentials ---
 REPO_HOST="repo.magento.com"
@@ -199,7 +183,7 @@ load_creds() {
   if [[ -n $u && -n $p ]]; then
     CRED_RC="$TMP_DIR/wgetrc"; ( umask 077; printf 'http_user = %s\nhttp_password = %s\nauth_no_challenge = on\n' "$u" "$p" >"$CRED_RC" )
   else
-    warn "No repo.magento.com credentials found — requests to $REPO_HOST will be anonymous"
+    info "No repo.magento.com keys found — fine for public patches; entitled (extended-support) patches will need them"
   fi
 }
 load_creds
@@ -213,117 +197,159 @@ fetch() {   # fetch <url> <wget args...>  — only attaches creds for repo.magen
     wget "$@" "$url"
   fi
 }
-http_status() {  # prints final HTTP status code for a URL (HEAD-style probe)
+http_status() {  # final HTTP status for a URL
   fetch "$1" --spider -S -T 20 -t 2 2>&1 | awk '/^ *HTTP\//{c=$2} END{print c+0}' || true
 }
 
-# ------------------------------------------------------------ date helpers --
-mon_num() { case "$1" in jan) echo 01;; feb) echo 02;; mar) echo 03;; apr) echo 04;; may) echo 05;; jun) echo 06;;
-                         jul) echo 07;; aug) echo 08;; sep) echo 09;; oct) echo 10;; nov) echo 11;; dec) echo 12;; *) return 1;; esac; }
-month_add() { date -d "$1-01 $2 month" +%Y-%m; }          # month_add 2026-09 +1
-pretty_ym() { date -d "${1:0:4}-${1:4:2}-01" '+%b %Y'; }   # 202609 -> Sep 2026
-
-BUNDLE_RE='^([0-9]+-[0-9]+-[0-9]+)(-p([0-9]+))?-([a-z]{3})-([0-9]{4})\.zip$'
-CANDIDATES="$TMP_DIR/candidates"; : >"$CANDIDATES"
-add_candidate() {  # add_candidate <url>  → "YYYYMM PLEVEL URL NAME" if it matches our version line
-  local url="$1" name; name="$(basename "${url%%\?*}")"
-  if [[ ! ${name,,} =~ $BUNDLE_RE ]]; then warn "Ignoring $name — doesn't match <ver>-p<N>-<mon>-<yyyy>.zip"; return 0; fi
-  local ver="${BASH_REMATCH[1]}" p="${BASH_REMATCH[3]:-0}" mon="${BASH_REMATCH[4]}" yr="${BASH_REMATCH[5]}" mm
-  mm="$(mon_num "$mon")" || { warn "Ignoring $name — bad month '$mon'"; return 0; }
-  if [[ $ver != "$BASE_DASH" ]]; then info "Skipping $name — for $ver, this site is $BASE_DASH"; return 0; fi
-  echo "$yr$mm $p $url ${name,,}" >>"$CANDIDATES"
-}
-
-# ------------------------------------------------- 1. URL lists -------------
-read_url_list() {  # read_url_list <file> <repo_only 0|1>
-  local line
-  while IFS= read -r line || [[ -n $line ]]; do
-    line="${line%%#*}"; line="$(echo "$line" | xargs)"; [[ -z $line ]] && continue
-    if [[ $2 == 1 && ! $line =~ ^https://$REPO_HOST/ ]]; then
-      warn "Ignoring $line from the central list — only https://$REPO_HOST/ URLs are allowed there"; continue
-    fi
-    add_candidate "$line"
-  done <"$1"
-}
-if [[ -n $KNOWN_LIST_URL ]]; then
-  if fetch "$KNOWN_LIST_URL" -q -T 20 -t 2 -O "$TMP_DIR/known.txt"; then
-    info "Reading central list of known bundles from $KNOWN_LIST_URL"
-    read_url_list "$TMP_DIR/known.txt" 1
-  else
-    warn "Couldn't fetch the central list ($KNOWN_LIST_URL) — continuing with discovery only"
-  fi
-fi
-if [[ -n $URL_LIST ]]; then
-  [[ -f $URL_LIST ]] || die "URL list not found: $URL_LIST"
-  info "Reading extra bundle URLs from $URL_LIST"
-  read_url_list "$URL_LIST" 0
-fi
-
-# ------------------------------------------------- 2. auto-discovery --------
-NOW_YM="$(date +%Y-%m)"
-LAST_YM="$(awk -F'|' -v b="$BASE" '$2 ~ "^"b"(-p|$)" {print $3}' "$APPLIED_LOG" | sort | tail -1)"
-if [[ -n $LAST_YM ]]; then
-  START_YM="$(month_add "${LAST_YM:0:4}-${LAST_YM:4:2}" +1)"
-  info "Last applied bundle for $BASE: $(pretty_ym "$LAST_YM") — probing from $(date -d "$START_YM-01" '+%b %Y')"
+# --------------------------------------------------------------- registry ---
+REG_FILE="$TMP_DIR/registry.json"
+if [[ -f $REGISTRY ]]; then
+  cp "$REGISTRY" "$REG_FILE"; info "Using local registry $REGISTRY"
+elif [[ $REGISTRY =~ ^https?:// ]]; then
+  fetch "$REGISTRY" -q -T 30 -t 3 -O "$REG_FILE" || { alert "Registry unavailable" "Could not download $REGISTRY"; exit 1; }
+  info "Fetched patch registry $REGISTRY"
 else
-  START_YM="$(month_add "$NOW_YM" "-$LOOKBACK_MONTHS")"
-  info "No history for $BASE — probing the last $LOOKBACK_MONTHS months"
+  die "Registry not found: $REGISTRY"
 fi
-END_YM="$(month_add "$NOW_YM" "+$LOOKAHEAD_MONTHS")"
 
-ym="$START_YM"
-while [[ ! $ym > $END_YM ]]; do
-  mon="$(date -d "$ym-01" +%b | tr 'A-Z' 'a-z')"; yr="${ym:0:4}"
-  found=0
-  for (( p = PLEVEL; p <= PLEVEL + P_AHEAD && found == 0; p++ )); do
-    if (( p == 0 )); then names=("$BASE_DASH-$mon-$yr.zip" "$BASE_DASH-p0-$mon-$yr.zip")
-    else names=("$BASE_DASH-p$p-$mon-$yr.zip"); fi
-    for base in $PATCH_BASE_URLS; do
-      for n in "${names[@]}"; do
-        url="${base%/}/$n"; code="$(http_status "$url")"
-        case "$code" in
-          200) info "Found $url"; add_candidate "$url"; found=1; break 2 ;;
-          401|403) alert "Authentication failed" "HTTP $code from $url — check repo.magento.com access keys"; exit 1 ;;
-        esac
-      done
-    done
-  done
-  (( found )) || info "No bundle published for $(date -d "$ym-01" '+%b %Y') (checked p$PLEVEL–p$((PLEVEL + P_AHEAD)))"
-  ym="$(month_add "$ym" +1)"
-done
+# The planner reads the registry + installed packages, and prints a TSV plan:
+#   FATAL|WARN|INFO <msg>          BASE <patch_base_url>
+#   AREA <area> <version|-> <source>
+#   PLAN <id> <area> <ver> <file_name> <sha256> <released> <requires,..> <recorded sha|-> <cve count> <entitled 0|1>
+#   SKIP <id> <area> <released> <reason>
+#   UPGRADE <area> <installed> <newer version> <patch count> <latest released>
+cat >"$TMP_DIR/plan.php" <<'PHP'
+<?php
+[, $regFile, $root, $ceVersion, $appliedLog] = $argv;
+function out(...$f) { echo implode("\t", array_map(function ($x) { return str_replace(["\t", "\n", "\r"], ' ', (string)$x); }, $f)), "\n"; }
+function pv($v) { return preg_match('/^(\d+\.\d+\.\d+)(?:-p(\d+))?/', (string)$v, $m) ? [$m[1], (int)($m[2] ?? 0)] : null; }
 
-# ------------------------------------------- 3. choose one bundle per month --
-declare -A EXACT=() HIGHER=() LOWER=()
-while read -r ym p url name; do
-  [[ -z ${ym:-} ]] && continue
-  if   (( p == PLEVEL )); then EXACT[$ym]="$p $url $name"
-  elif (( p >  PLEVEL )); then [[ -z ${HIGHER[$ym]:-} ]] && HIGHER[$ym]="$p $url $name"
-  else LOWER[$ym]="$p $url $name"; fi
-done < <(sort -u "$CANDIDATES" | sort -k1,1n -k2,2n)
+$reg = json_decode((string)@file_get_contents($regFile), true);
+if (!is_array($reg) || !isset($reg['patches']) || !is_array($reg['patches'])) { out('FATAL', 'registry is not valid JSON or has no "patches" object'); exit(0); }
+$schemaV = (string)($reg['_schema']['version'] ?? '?');
+if (!preg_match('/^1\./', $schemaV)) out('WARN', "unexpected registry schema version $schemaV (this script understands 1.x)");
+$base = rtrim((string)($reg['_schema']['patch_base_url'] ?? ''), '/');
+if ($base === '') { out('FATAL', 'registry has no _schema.patch_base_url — refusing to guess where patches live'); exit(0); }
+if (strpos($base . '/', 'https://repo.magento.com/') !== 0) { out('FATAL', "patch_base_url '$base' is not on https://repo.magento.com/ — refusing"); exit(0); }
+out('BASE', $base);
 
-MONTHS="$(printf '%s\n' "${!EXACT[@]}" "${!HIGHER[@]}" "${!LOWER[@]}" | grep -v '^$' | sort -un || true)"
-if [[ -z $MONTHS ]]; then ok "No patch bundles found for $INSTALLED — nothing to do."; exit 0; fi
-
-# --------------------------------------------------- patch application -----
-select_patch_files() {  # select_patch_files <dir>  → prints patch files, sorted
-  local dir="$1" f; local -a composer=() git=() generic=()
-  while IFS= read -r -d '' f; do
-    case "${f,,}" in
-      *.composer.patch|*.composer.diff) composer+=("$f") ;;
-      *.git.patch|*.git.diff)           git+=("$f") ;;
-      *)                                generic+=("$f") ;;
-    esac
-  done < <(find "$dir" -type f \( -iname '*.patch' -o -iname '*.diff' \) ! -path '*/__MACOSX/*' -print0 | sort -z)
-  # Adobe ships both flavours: composer-format (vendor/magento/...) and git-format (app/code/Magento/...)
-  if [[ -d $MAGENTO_ROOT/vendor/magento && ${#composer[@]} -gt 0 ]]; then printf '%s\n' "${composer[@]}"
-  elif [[ -d $MAGENTO_ROOT/app/code/Magento && ${#git[@]} -gt 0 ]]; then printf '%s\n' "${git[@]}"
-  elif [[ ${#composer[@]} -gt 0 ]]; then printf '%s\n' "${composer[@]}"
-  elif [[ ${#git[@]} -gt 0 ]]; then printf '%s\n' "${git[@]}"; fi
-  [[ ${#generic[@]} -gt 0 ]] && printf '%s\n' "${generic[@]}"
-  return 0
+// Installed packages: vendor/composer/installed.json (what's really there) first, then composer.lock
+$installed = [];
+foreach (["$root/vendor/composer/installed.json" => 'vendor/composer/installed.json', "$root/composer.lock" => 'composer.lock'] as $f => $src) {
+    if (!is_file($f)) continue;
+    $j = json_decode((string)file_get_contents($f), true);
+    if (!is_array($j)) continue;
+    $pk = isset($j['packages']) ? array_merge($j['packages'], $j['packages-dev'] ?? []) : (isset($j[0]) ? $j : []);
+    foreach ($pk as $p) {
+        if (!isset($p['name'], $p['version'])) continue;
+        $n = strtolower($p['name']);
+        if (!isset($installed[$n])) $installed[$n] = [ltrim($p['version'], 'vV'), $src];
+    }
 }
 
-P() { patch -d "$MAGENTO_ROOT" -p1 -f --no-backup-if-mismatch "$@"; }
+// Installed version per area
+$areas = $reg['_areas'] ?? [];
+$areaVer = [];
+foreach ($areas as $area => $def) {
+    if (($def['detection'] ?? '') === 'base_version') { $areaVer[$area] = $ceVersion; out('AREA', $area, $ceVersion, 'installed Magento version'); continue; }
+    $pkg = strtolower((string)($def['composer_package'] ?? ''));
+    if ($pkg !== '' && isset($installed[$pkg])) { $areaVer[$area] = $installed[$pkg][0]; out('AREA', $area, $installed[$pkg][0], "$pkg ({$installed[$pkg][1]})"); }
+    else out('AREA', $area, '-', $pkg !== '' ? $pkg : 'no detection rule');
+}
+
+// Already recorded: R|id|area|ver|released|applied_at|sha256|result
+$applied = [];
+if (is_file($appliedLog)) foreach (file($appliedLog, FILE_IGNORE_NEW_LINES) as $l) {
+    $c = explode('|', $l);
+    if (count($c) >= 8 && $c[0] === 'R') $applied[$c[1]] = $c[6];
+}
+
+$P = $reg['patches'];
+$cand = []; $bad = [];
+foreach ($P as $id => $p) {
+    $area = (string)($p['area'] ?? '');
+    if (!isset($areas[$area])) continue;
+    if (!isset($areaVer[$area]) || !in_array($areaVer[$area], (array)($p['applies_to'] ?? []), true)) continue;
+    $fn = (string)($p['file_name'] ?? ''); $sha = strtolower((string)($p['sha256'] ?? ''));
+    if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]*\.(diff|patch)$/', $fn)) { $bad[$id] = "unsupported file_name '$fn' in registry (expected a .diff or .patch)"; continue; }
+    if (!preg_match('/^[0-9a-f]{64}$/', $sha)) { $bad[$id] = 'missing/invalid sha256 in registry'; continue; }
+    $cand[$id] = $p;
+}
+
+// Prerequisites: each must be in the plan, already recorded, or it blocks (transitively)
+do {
+    $changed = false;
+    foreach ($cand as $id => $p) {
+        foreach ((array)($p['requires'] ?? []) as $r) {
+            $why = null;
+            if (isset($bad[$r])) $why = "requires $r, which can't be applied";
+            elseif (isset($cand[$r]) || isset($applied[$r])) continue;
+            elseif (!isset($P[$r])) $why = "requires $r, which is not in the registry";
+            else $why = "requires $r, which does not apply to this install (" . ($P[$r]['area'] ?? '?') . ' ' . implode('/', (array)($P[$r]['applies_to'] ?? [])) . ')';
+            $bad[$id] = $why; unset($cand[$id]); $changed = true; break;
+        }
+    }
+} while ($changed);
+foreach ($bad as $id => $why) out('SKIP', $id, $P[$id]['area'] ?? '?', $P[$id]['released'] ?? '?', $why);
+
+// Topological order on "requires", ties broken by release date then id
+$indeg = []; $kids = [];
+foreach ($cand as $id => $p) { $indeg[$id] = 0; }
+foreach ($cand as $id => $p) foreach ((array)($p['requires'] ?? []) as $r) if (isset($cand[$r])) { $indeg[$id]++; $kids[$r][] = $id; }
+$key = function ($id) use ($cand) { return ($cand[$id]['released'] ?? '9999') . "\0" . $id; };
+$ready = array_keys(array_filter($indeg, function ($d) { return $d === 0; }));
+$order = [];
+while ($ready) {
+    usort($ready, function ($a, $b) use ($key) { return strcmp($key($a), $key($b)); });
+    $id = array_shift($ready); $order[] = $id;
+    foreach ($kids[$id] ?? [] as $k) if (--$indeg[$k] === 0) $ready[] = $k;
+}
+foreach ($cand as $id => $p) if (!in_array($id, $order, true)) out('SKIP', $id, $p['area'], $p['released'] ?? '?', 'dependency cycle in registry requires');
+foreach ($order as $id) {
+    $p = $cand[$id];
+    out('PLAN', $id, $p['area'], $areaVer[$p['area']], $p['file_name'], strtolower($p['sha256']), $p['released'] ?? '?',
+        implode(',', (array)($p['requires'] ?? [])) ?: '-', $applied[$id] ?? '-', count((array)($p['cves'] ?? [])), empty($p['entitlements']) ? 0 : 1);
+}
+
+// Newer patch levels on the same line (e.g. installed 2.4.7-p9, patches exist for 2.4.7-p10)
+foreach ($areaVer as $area => $iv) {
+    $mine = pv($iv); if (!$mine) continue;
+    $newer = []; $latest = '';
+    foreach ($P as $id => $p) {
+        if (($p['area'] ?? '') !== $area || in_array($iv, (array)($p['applies_to'] ?? []), true)) continue;
+        foreach ((array)($p['applies_to'] ?? []) as $v) {
+            $t = pv($v);
+            if ($t && $t[0] === $mine[0] && $t[1] > $mine[1]) { $newer[$v][] = $id; $latest = max($latest, (string)($p['released'] ?? '')); }
+        }
+    }
+    if ($newer) {
+        uksort($newer, function ($a, $b) { return pv($a)[1] <=> pv($b)[1]; });
+        $keys = array_keys($newer); $top = end($keys);
+        out('UPGRADE', $area, $iv, $top, count($newer[$top]), $latest);
+    } elseif (($areas[$area]['detection'] ?? '') === 'base_version') {
+        $any = false;
+        foreach ($P as $p) if (in_array($iv, (array)($p['applies_to'] ?? []), true)) { $any = true; break; }
+        if (!$any) out('UNSUPPORTED', $area, $iv);
+    }
+}
+PHP
+php "$TMP_DIR/plan.php" "$REG_FILE" "$MAGENTO_ROOT" "$INSTALLED" "$APPLIED_LOG" >"$TMP_DIR/plan.tsv" \
+  || die "Registry planner failed (php error)"
+
+BASE_URL=""; UNSUPPORTED=""; declare -a PLAN=() SKIPS=() UPGRADES=()
+while IFS=$'\t' read -r kind a b c d e f g h i j; do
+  case "$kind" in
+    FATAL)   alert "Registry rejected" "$a"; exit 1 ;;
+    WARN)    warn "$a" ;;
+    BASE)    BASE_URL="$a" ;;
+    AREA)    [[ $b != - ]] && info "  area $(printf '%-12s' "$a") $b  ($c)" ;;
+    PLAN)    PLAN+=("$a"$'\t'"$b"$'\t'"$c"$'\t'"$d"$'\t'"$e"$'\t'"$f"$'\t'"$g"$'\t'"$h"$'\t'"$i"$'\t'"$j") ;;
+    SKIP)    SKIPS+=("$a"$'\t'"$b"$'\t'"$c"$'\t'"$d") ;;
+    UPGRADE) UPGRADES+=("$a"$'\t'"$b"$'\t'"$c"$'\t'"$d"$'\t'"$e") ;;
+    UNSUPPORTED) UNSUPPORTED="$b" ;;
+  esac
+done <"$TMP_DIR/plan.tsv"
+info "Registry: ${#PLAN[@]} patch(es) apply to this install, ${#SKIPS[@]} blocked"
 
 # --------------------------------------------------- applicability check ----
 # Splits a unified diff into one file per target (sec/<n>.diff) and prints a
@@ -373,14 +399,30 @@ pkg_label() {  # vendor/magento/module-company -> magento/module-company
   case "$1" in vendor/*) echo "${1#vendor/}" ;; app/code/*) local r="${1#app/code/}"; echo "${r/\//_}" ;; *) echo "$1" ;; esac
 }
 
+# Dry runs apply everything for real to a scratch copy of just the files the
+# patches touch, so chained patches (Sep requires Aug requires Jul) are each
+# tested against the result of the previous one — exactly like a real run.
+APPLY_ROOT="$MAGENTO_ROOT"; declare -A SHADOW=()
+if (( DRY_RUN )); then APPLY_ROOT="$TMP_DIR/shadow"; mkdir -p "$APPLY_ROOT"; fi
+t_exists() { if (( DRY_RUN )) && [[ -n ${SHADOW[$1]:-} ]]; then [[ -e $APPLY_ROOT/$1 ]]; else [[ -e $MAGENTO_ROOT/$1 ]]; fi; }
+d_exists() { [[ -d $MAGENTO_ROOT/$1 || -d $APPLY_ROOT/$1 ]]; }
+shadow_prepare() {  # copy targets into the scratch copy the first time they're touched
+  (( DRY_RUN )) || return 0
+  local t
+  for t in "$@"; do
+    [[ -n ${SHADOW[$t]:-} ]] && continue; SHADOW[$t]=1
+    if [[ -e $MAGENTO_ROOT/$t ]]; then mkdir -p "$APPLY_ROOT/$(dirname "$t")"; cp -p "$MAGENTO_ROOT/$t" "$APPLY_ROOT/$t"; fi
+  done
+}
+
 # assess_patch <patch file> <work dir>
 # Sets: AP_STATUS (ok|partial|na|missing), AP_FILE (patch to apply: original or
-# filtered), AP_TOTAL, AP_OK, AP_NA_PKGS, AP_MISSING (newline-separated details)
+# filtered), AP_TOTAL, AP_OK, AP_NA_PKGS, AP_MISSING, AP_TARGETS (kept targets)
 assess_patch() {
   local f="$1" work="$2" idx old new target root
-  local -a keep=() ; local -A na_pkgs=()
+  local -a keep=(); local -A na_pkgs=()
   rm -rf "$work"; mkdir -p "$work/sec"
-  AP_TOTAL=0; AP_OK=0; AP_MISSING=""; AP_NA_PKGS=""; AP_FILE="$f"
+  AP_TOTAL=0; AP_OK=0; AP_MISSING=""; AP_NA_PKGS=""; AP_FILE="$f"; AP_TARGETS=()
   while IFS=$'\t' read -r idx old new; do
     [[ -z $idx ]] && continue
     AP_TOTAL=$((AP_TOTAL + 1))
@@ -390,17 +432,17 @@ assess_patch() {
     fi
     root="$(pkg_root "$target")"
     if [[ $old == /dev/null ]]; then                       # patch creates a new file
-      if [[ -e $MAGENTO_ROOT/$target || -d $MAGENTO_ROOT/$root ]]; then keep+=("$idx"); else na_pkgs[$(pkg_label "$root")]=1; fi
-    elif [[ -e $MAGENTO_ROOT/$target ]]; then              # modifies / deletes an existing file
-      keep+=("$idx")
-    elif [[ -d $MAGENTO_ROOT/$root ]]; then                # package installed but file missing: real problem
+      if t_exists "$target" || d_exists "$root"; then keep+=("$idx"); AP_TARGETS+=("$target"); else na_pkgs[$(pkg_label "$root")]=1; fi
+    elif t_exists "$target"; then                          # modifies / deletes an existing file
+      keep+=("$idx"); AP_TARGETS+=("$target")
+    elif d_exists "$root"; then                            # package installed but file missing: real problem
       AP_MISSING+="$target (package $(pkg_label "$root") is installed but this file is missing)"$'\n'
     else
       na_pkgs[$(pkg_label "$root")]=1
     fi
   done < <(awk -v dir="$work/sec" "$PATCH_SPLIT_AWK" "$f")
   AP_OK=${#keep[@]}
-  AP_NA_PKGS="$(printf '%s\n' "${!na_pkgs[@]}" | grep -v '^$' | sort | paste -sd, - | sed 's/,/, /g')"
+  AP_NA_PKGS="$(printf '%s\n' "${!na_pkgs[@]}" | grep -v '^$' | sort | paste -sd, - | sed 's/,/, /g' || true)"
   if (( AP_TOTAL == 0 )); then AP_STATUS=missing; AP_MISSING+="no file headers (--- / +++) found"$'\n'
   elif [[ -n $AP_MISSING ]]; then AP_STATUS=missing
   elif (( AP_OK == 0 )); then AP_STATUS=na
@@ -410,99 +452,140 @@ assess_patch() {
   else AP_STATUS=ok; fi
 }
 
-apply_bundle() {  # apply_bundle <name> <dir>  — all-or-nothing
-  local name="$1" dir="$2" f out n=0; local -a files=() done_files=()
-  mapfile -t files < <(select_patch_files "$dir")
-  if [[ ${#files[@]} -eq 0 ]]; then alert "Empty bundle" "$name contains no .patch/.diff files"; return 3; fi
-  info "$name: ${#files[@]} patch file(s)"
-  APPLIED_COUNT=0; SKIPPED_COUNT=0; NA_COUNT=0
+# Same strictness as Adobe's own vendor/bin/patch-status tool: no fuzz, never prompt
+P() { patch -d "$APPLY_ROOT" -p1 --fuzz=0 --batch --forward --no-backup-if-mismatch "$@"; }
+
+# apply_unit <id> <patch files...>  — all-or-nothing; sets UNIT_RESULT (applied|already|na) + counts
+apply_unit() {
+  local id="$1"; shift
+  local f out n=0 rel; local -a done_files=()
+  U_NEW=0; U_ALREADY=0; U_NA=0; U_NOTE=""
   rollback() {
-    if (( ${#done_files[@]} )); then
-      warn "  Rolling back ${#done_files[@]} patch(es) already applied from $name"
-      for (( i=${#done_files[@]}-1; i>=0; i-- )); do P -R -s <"${done_files[$i]}" || warn "  rollback failed: ${done_files[$i]}"; done
-    fi
+    local i
+    for (( i=${#done_files[@]}-1; i>=0; i-- )); do P -R -s <"${done_files[$i]}" || warn "  rollback failed: ${done_files[$i]}"; done
   }
-  for f in "${files[@]}"; do
-    local rel="${f#"$dir"/}"; n=$((n + 1))
-    assess_patch "$f" "$TMP_DIR/assess/$n"
+  for f in "$@"; do
+    rel="$(basename "$f")"; n=$((n + 1))
+    assess_patch "$f" "$TMP_DIR/assess/$id/$n"
     case "$AP_STATUS" in
       na)
-        info "  - $rel: NOT APPLICABLE — targets packages not installed here: $AP_NA_PKGS"
-        NA_COUNT=$((NA_COUNT + 1)); continue ;;
+        info "    - $rel: NOT APPLICABLE — targets packages not installed here: $AP_NA_PKGS"
+        U_NA=$((U_NA + 1)); U_NOTE="not installed: $AP_NA_PKGS"; continue ;;
       missing)
-        log ERROR "  x $rel: targets files that should exist but don't:"
-        printf '%s' "$AP_MISSING" | sed 's/^/      /' | tee -a "$RUN_LOG" >&2
-        rollback
-        alert "Patch target missing" "$rel in $name targets files missing from installed packages (wrong version, or files removed/overridden?). Bundle rolled back; later bundles NOT applied."
-        return 3 ;;
+        log ERROR "    x $rel targets files that should exist but don't:"
+        printf '%s' "$AP_MISSING" | sed 's/^/        /' | tee -a "$RUN_LOG" >&2
+        rollback; U_NOTE="target file(s) missing from installed packages"; return 3 ;;
       partial)
-        info "  ! $rel: $AP_OK of $AP_TOTAL files apply; skipping the rest — not installed here: $AP_NA_PKGS" ;;
+        info "    ! $rel: $AP_OK of $AP_TOTAL files apply; skipping the rest — not installed here: $AP_NA_PKGS"
+        U_NOTE="partly N/A: $AP_NA_PKGS" ;;
     esac
+    shadow_prepare "${AP_TARGETS[@]}"
     if P -R --dry-run -s <"$AP_FILE" >/dev/null 2>&1; then
-      info "  = $rel (already applied)"; SKIPPED_COUNT=$((SKIPPED_COUNT + 1)); continue
+      info "    = $rel (already applied)"; U_ALREADY=$((U_ALREADY + 1)); continue
     fi
     if ! out="$(P --dry-run <"$AP_FILE" 2>&1)"; then
-      log ERROR "  x $rel will not apply cleanly:"; printf '%s\n' "$out" | sed 's/^/      /' | tee -a "$RUN_LOG" >&2
-      rollback
-      alert "Patch conflict" "$rel in $name does not apply to $INSTALLED (core files modified, or a vendor override?). Bundle rolled back; later bundles NOT applied."
-      return 3
+      log ERROR "    x $rel will not apply cleanly:"; printf '%s\n' "$out" | sed 's/^/        /' | tee -a "$RUN_LOG" >&2
+      rollback; U_NOTE="does not apply cleanly (modified core files or a vendor override?)"; return 3
     fi
-    if (( DRY_RUN )); then info "  ~ $rel (would apply)"; else
-      P -s <"$AP_FILE"; info "  + $rel"
-      cp "$AP_FILE" "$TMP_DIR/assess/$n.applied"; done_files+=("$TMP_DIR/assess/$n.applied"); fi
-    APPLIED_COUNT=$((APPLIED_COUNT + 1))
+    P -s <"$AP_FILE"
+    cp "$AP_FILE" "$TMP_DIR/assess/$id/$n.applied"; done_files+=("$TMP_DIR/assess/$id/$n.applied")
+    if (( DRY_RUN )); then info "    ~ $rel (would apply)"; else info "    + $rel"; fi
+    U_NEW=$((U_NEW + 1))
   done
+  if   (( U_NEW > 0 )); then UNIT_RESULT=applied
+  elif (( U_ALREADY > 0 )); then UNIT_RESULT=already
+  else UNIT_RESULT=na; fi
   return 0
 }
 
+# ------------------------------------------------------------ apply plan ----
+declare -A FAILED=()
 SUMMARY=(); ANY_APPLIED=0; RC=0
-for ym in $MONTHS; do
-  REL="$(pretty_ym "$ym")"
-  if [[ -n ${EXACT[$ym]:-} ]]; then
-    read -r p url name <<<"${EXACT[$ym]}"
-  elif [[ -n ${HIGHER[$ym]:-} ]]; then
-    read -r p url name <<<"${HIGHER[$ym]}"
-    alert "Upgrade required" "The $REL security bundle ($name) requires Magento $BASE-p$p; this site is on $INSTALLED. Upgrade to $BASE-p$p first — this and any later bundles have NOT been applied."
-    SUMMARY+=("BLOCKED  $REL  $name  — needs $BASE-p$p (installed $INSTALLED)")
-    RC=2; break
-  else
-    read -r p url name <<<"${LOWER[$ym]}"
-    warn "Skipping $name ($REL) — targets $BASE-p$p, installed is $INSTALLED (fixes should already be included)"
-    SUMMARY+=("SKIPPED  $REL  $name  — targets older p$p"); continue
+row() { SUMMARY+=("$(printf '%-9s %s  %-28s %s' "$1" "$2" "$3" "$4")"); }
+
+for line in "${SKIPS[@]}"; do
+  IFS=$'\t' read -r id area rel why <<<"$line"
+  FAILED[$id]=blocked; warn "Blocked: $id — $why"; row BLOCKED "$rel" "$id" "— $why"
+done
+
+for line in "${PLAN[@]}"; do
+  IFS=$'\t' read -r id area ver file sha rel reqs recorded ncve entitled <<<"$line"
+  label="$area $ver, $ncve CVE$([[ $ncve == 1 ]] || echo s)"
+  info "${C_B}$id${C_0}  ($label, released $rel)"
+
+  # prerequisites that failed earlier in this run block this patch too
+  blocker=""
+  if [[ $reqs != - ]]; then
+    IFS=, read -r -a req_arr <<<"$reqs"
+    for r in "${req_arr[@]}"; do [[ -n ${FAILED[$r]:-} ]] && { blocker="$r"; break; }; done
+  fi
+  if [[ -n $blocker ]]; then
+    FAILED[$id]=blocked; warn "  Skipped — requires $blocker, which failed"; row SKIPPED "$rel" "$id" "— requires $blocker, which failed"; continue
   fi
 
-  if prev="$(awk -F'|' -v n="$name" '$1==n {print $5}' "$APPLIED_LOG" | tail -1)" && [[ -n $prev ]]; then
-    info "$name ($REL) already recorded as applied on $prev"; continue
+  if [[ $recorded == "$sha" ]]; then
+    info "  already recorded as applied"; continue
+  elif [[ $recorded != - ]]; then
+    warn "  registry sha256 changed since this patch was recorded — re-checking"
   fi
 
-  zip="$DL_DIR/$name"; dir="$EX_DIR/${name%.zip}"
-  if [[ ! -s $zip ]]; then
-    info "Downloading $url"
-    fetch "$url" -q -T 60 -t 3 -O "$zip.part" || { rm -f "$zip.part"; alert "Download failed" "$url"; RC=1; break; }
-    mv "$zip.part" "$zip"
+  # download + integrity
+  dest="$DL_DIR/$file"
+  url="$BASE_URL/$file"   # exactly as the registry says; the server redirects entitled patches itself
+  if [[ ! -s $dest || "$(sha256 "$dest")" != "$sha" ]]; then
+    rm -f "$dest" "$dest.part"
+    if ! fetch "$url" -q -T 60 -t 3 -O "$dest.part"; then
+      rm -f "$dest.part"; code="$(http_status "$url")"
+      if [[ $code == 401 || $code == 403 ]]; then
+        if [[ -n $CRED_RC ]]; then why="repo.magento.com keys were rejected — check they carry the required entitlement (HTTP $code)"
+        else why="needs repo.magento.com keys with the required entitlement (HTTP $code)"; fi
+      else why="download failed (HTTP ${code:-?})"; fi
+      FAILED[$id]=download; alert "Patch download failed" "$id: $why — $url"; row FAILED "$rel" "$id" "— $why"; RC=3; continue
+    fi
+    mv "$dest.part" "$dest"
   fi
-  unzip -tqq "$zip" >/dev/null 2>&1 || { rm -f "$zip"; alert "Corrupt download" "$name failed zip integrity check (deleted; will retry next run)"; RC=1; break; }
-  rm -rf "$dir"; mkdir -p "$dir"; unzip -qq -o "$zip" -d "$dir"
-  SHA="$(sha256sum "$zip" | cut -d' ' -f1)"
+  got="$(sha256 "$dest")"
+  if [[ $got != "$sha" ]]; then
+    rm -f "$dest"; FAILED[$id]=hash
+    alert "Integrity check failed" "$id: sha256 $got does not match the registry ($sha). File deleted, NOT applied."
+    row FAILED "$rel" "$id" "— sha256 mismatch (not applied)"; RC=3; continue
+  fi
+  info "  sha256 verified"
 
-  info "${C_B}Applying $REL security bundle${C_0} — $name (for $BASE-p$p)"
-  if apply_bundle "$name" "$dir"; then
-    STAMP="$(date '+%F %T %Z')"
-    if (( DRY_RUN )); then
-      SUMMARY+=("DRY-RUN  $REL  $name  — $APPLIED_COUNT would apply, $SKIPPED_COUNT already present, $NA_COUNT not applicable")
-    else
-      echo "$name|$BASE-p$p|$ym|$REL|$STAMP|$SHA|$APPLIED_COUNT/$SKIPPED_COUNT/$NA_COUNT" >>"$APPLIED_LOG"
-      SUMMARY+=("APPLIED  $REL  $name  — released $REL, applied $STAMP ($APPLIED_COUNT new, $SKIPPED_COUNT already present, $NA_COUNT not applicable)")
-      (( APPLIED_COUNT > 0 )) && ANY_APPLIED=1
-      ok "$REL bundle applied ($name)"
+  if apply_unit "$id" "$dest"; then
+    stamp="$(date '+%F %T %Z')"
+    case "$UNIT_RESULT" in
+      applied) what="$([[ $DRY_RUN == 1 ]] && echo WOULD-APPLY || echo APPLIED)"; ANY_APPLIED=1 ;;
+      already) what=ALREADY ;;
+      na)      what=N/A ;;
+    esac
+    row "$what" "$rel" "$id" "($label)${U_NOTE:+ — $U_NOTE}"
+    if (( ! DRY_RUN )); then
+      echo "R|$id|$area|$ver|$rel|$stamp|$sha|$UNIT_RESULT" >>"$APPLIED_LOG"
+      if [[ $UNIT_RESULT == applied ]]; then ok "  $id applied"; fi
     fi
   else
-    RC=$?; SUMMARY+=("FAILED   $REL  $name  — rolled back; later months not attempted"); break
+    FAILED[$id]=apply; RC=3
+    alert "Patch failed" "$id ($label): $U_NOTE. Nothing from this patch was applied; patches that require it are skipped."
+    row FAILED "$rel" "$id" "— $U_NOTE"
   fi
 done
 
+for line in "${UPGRADES[@]}"; do
+  IFS=$'\t' read -r area cur newer count latest <<<"$line"
+  alert "Upgrade required" "$area is on $cur, but $count newer security patch(es) up to $latest only apply to $newer. Upgrade $area to $newer to receive them."
+  row UPGRADE "$latest" "$area $cur -> $newer" "— $count patch(es) need $newer"
+  (( RC == 0 )) && RC=2
+done
+
+if [[ -n $UNSUPPORTED ]]; then
+  alert "Unsupported version" "No patch in Adobe's registry applies to Magento $UNSUPPORTED — this release line is likely out of security support. Plan an upgrade to a supported version."
+  row UNSUPPORTED "-" "Magento $UNSUPPORTED" "— no registry patches for this version"
+  (( RC == 0 )) && RC=2
+fi
+
 # ------------------------------------------------------- post-apply --------
-if (( ANY_APPLIED )); then
+if (( ANY_APPLIED && ! DRY_RUN )); then
   cd "$MAGENTO_ROOT"
   if (( DI_COMPILE )); then info "Running setup:di:compile"; php bin/magento setup:di:compile --no-ansi || warn "di:compile failed"; fi
   if (( CACHE_FLUSH )); then info "Flushing cache"; php bin/magento cache:flush --no-ansi >/dev/null || warn "cache:flush failed"; fi
@@ -512,9 +595,9 @@ if (( ANY_APPLIED )); then
 fi
 
 echo >&2
-printf '%s\n' "${C_B}Summary for $MAGENTO_ROOT (Magento $INSTALLED)${C_0}" >&2
+printf '%s\n' "${C_B}Summary for $MAGENTO_ROOT (Magento $INSTALLED)$([[ $DRY_RUN == 1 ]] && echo ' — DRY RUN, nothing changed')${C_0}" >&2
 if (( ${#SUMMARY[@]} )); then printf '  %s\n' "${SUMMARY[@]}" | tee -a "$RUN_LOG" >&2
-else printf '  %s\n' "Everything up to date — no new bundles." >&2; fi
+else printf '  %s\n' "Up to date — every registry patch for this install is already applied." >&2; fi
 echo "  History: $APPLIED_LOG   Log: $RUN_LOG" >&2
 exit "$RC"
 }

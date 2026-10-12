@@ -29,14 +29,14 @@ Always keep the `-f` in `curl -fsSL`. Without it, a 404 or GitHub error page get
 
 ## How it works
 
-1. **Reads the registry** from `https://repo.magento.com/patch/patch-registry.json`. The script refuses a registry whose `patch_base_url` isn't on `https://repo.magento.com/`.
+1. **Reads the registry** from `https://repo.magento.com/patch/patch-registry.json`. Every download URL comes from the registry (`patch_base_url` + `file_name`); nothing is guessed or constructed. The script refuses a registry with no `patch_base_url`, or one that isn't on `https://repo.magento.com/`, and only accepts `.diff`/`.patch` files.
 2. **Detects what's installed, per area.** The registry splits patches by area:
    - **CE** uses the Magento version, from `bin/magento -V`, falling back to `composer.lock` / `composer.json`.
    - **Every other area** (EE, B2B, PageBuilder, Inventory, …) uses the version of its composer package. It reads `vendor/composer/installed.json` first because that's what's actually on disk, then `composer.lock`. For example, B2B uses the version of `magento/extension-b2b`, such as `1.5.3`.
 3. **Selects the patches** whose `area` is installed and whose `applies_to` includes that area's exact installed version.
 4. **Resolves `requires`.** Every prerequisite must be in the plan or already applied. If one can't be met (not in the registry, or for a different version), the patch is **blocked**, along with anything that depends on it.
 5. **Orders the patches** topologically on `requires`, with ties broken by `released` date. For example, Sep requires Aug, which requires Jul, and the standalone `VULN-*` hotfixes slot in by date.
-6. **Downloads and verifies each `.diff`.** Patches with `entitlements` (extended-support versions) come from `/patch/auth/` using your repo.magento.com keys. Every file's **sha256 must match the registry** or it's deleted and not applied.
+6. **Downloads and verifies each `.diff`** from exactly the URL the registry gives. For patches with `entitlements` (extended-support versions), repo.magento.com redirects to its authenticated location and your keys go along with the request. Every file's **sha256 must match the registry** or it's deleted and not applied.
 7. **Checks the patch targets.** Every `---`/`+++` target is checked against the install:
    - **Target exists:** the change is applied.
    - **Whole package not installed:** reported as **Not Applicable** and skipped. If only some files in a patch are N/A, the rest of that patch is still applied.
@@ -101,7 +101,7 @@ On instances built without `var/` (e.g. fresh development replicas), there's no 
 
 ## Notes
 
-- **Requirements:** bash 4+, GNU `date`, `wget`, `unzip`, `patch`, `php`, `awk` and `sha256sum` (or `shasum`). That covers any standard Linux Magento host.
+- **Requirements:** bash 4+, GNU `date`, `wget`, `patch`, `php`, `awk` and `sha256sum` (or `shasum`). That covers any standard Linux Magento host.
 - **`composer install` removes the patches.** Anything applied under `vendor/` is overwritten by `composer install` or `composer update`, so run the patcher again afterwards.
 - **Production mode:** run `setup:di:compile` (or use `--compile`) and `setup:static-content:deploy` after patching if the patches touched PHP classes or frontend assets.
 - **Adobe's status tool:** the July 2026 patches install Adobe's own checker at `vendor/bin/patch-status`. It reads the same registry, so you can run it afterwards to cross-check what this script applied.
