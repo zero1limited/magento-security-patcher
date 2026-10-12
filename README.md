@@ -53,6 +53,19 @@ Running it again is safe. **Every run checks the actual files; it never trusts t
 
 `-n` downloads and verifies every patch, then applies the whole chain to a **scratch copy** of the affected files. Each chained patch (Jul → Aug → Sep) is tested against the result of the one before it, exactly as a real run would apply it. Nothing in the Magento install changes, and webhook/email alerts are logged but not sent. The only writes are to `var/security-patches/` (downloads, `run.log`, lock file).
 
+## Reset
+
+`--reset` starts from a clean slate. Use it straight after rebuilding `vendor/` (e.g. `rm -rf vendor && composer install`) when you want the whole patch chain applied from scratch and recorded fresh.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patcher.sh | bash -s -- --reset
+```
+
+- **History:** `var/security-patches/applied.log` is moved to `applied.log.<timestamp>.bak` and a new, empty history is started. The backup is kept so nothing is lost.
+- **Applying:** every applicable patch is applied from the beginning of its chain, and the run is recorded as `APPLIED`, not `RE-APPLIED`.
+- **If `vendor/` isn't actually clean:** the files are still checked, so nothing is applied twice and nothing breaks. Any patch found already fully or partly in place is listed in a `NOT-CLEAN` warning, so you know the baseline wasn't what you expected.
+- **With `-n`:** `--reset -n` shows what a reset run would do without touching the history or any files.
+
 ## Options
 
 | Option | Description |
@@ -60,6 +73,7 @@ Running it again is safe. **Every run checks the actual files; it never trusts t
 | `-r, --root DIR` | Magento root (default: current directory) |
 | `--registry URL\|FILE` | Patch registry (default: `https://repo.magento.com/patch/patch-registry.json`) |
 | `-n, --dry-run` | Download, verify and test every patch against a scratch copy; change nothing |
+| `--reset` | Start from a clean history and expect a clean (unpatched) `vendor/`; see [Reset](#reset) |
 | `--no-cache-flush` | Don't run `cache:flush` afterwards |
 | `--compile` | Run `setup:di:compile` after applying |
 | `--webhook URL` | Send alerts to a Slack-style incoming webhook (not sent on dry runs) |

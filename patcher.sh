@@ -42,6 +42,7 @@ ALERT_EMAIL="${ALERT_EMAIL:-}"            # needs a working `mail` command
 DRY_RUN=0
 CACHE_FLUSH=1
 DI_COMPILE=0
+RESET=0
 
 usage() {
   cat <<EOF
@@ -51,6 +52,10 @@ Usage: patcher.sh [options]
   -r, --root DIR          Magento root (default: current directory)
       --registry URL|FILE Patch registry (default: $REGISTRY)
   -n, --dry-run           Download, verify and test every patch against a scratch copy; change nothing
+      --reset             Start from a clean history: back up and remove var/security-patches/applied.log,
+                          then patch on the expectation that vendor/ is clean (e.g. straight after a fresh
+                          composer install). Anything found already patched is reported, never re-applied.
+                          With -n: shows what a reset run would do, without touching the history.
       --no-cache-flush    Skip bin/magento cache:flush after applying
       --compile           Run bin/magento setup:di:compile after applying
       --webhook URL       Post alerts to this webhook (not sent on dry runs)
@@ -71,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --registry)       REGISTRY="$2"; shift 2 ;;
     -n|--dry-run)     DRY_RUN=1; shift ;;
     --no-cache-flush) CACHE_FLUSH=0; shift ;;
+    --reset)          RESET=1; shift ;;
     --compile)        DI_COMPILE=1; shift ;;
     --webhook)        ALERT_WEBHOOK="$2"; shift 2 ;;
     --email)          ALERT_EMAIL="$2"; shift 2 ;;
@@ -139,7 +145,23 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 trap 'log ERROR "Unexpected failure at line $LINENO"' ERR
 
-info "${C_B}Magento security patcher${C_0} — root: $MAGENTO_ROOT$([[ $DRY_RUN == 1 ]] && echo '  (DRY RUN)')"
+info "${C_B}Magento security patcher${C_0} — root: $MAGENTO_ROOT$([[ $DRY_RUN == 1 ]] && echo '  (DRY RUN)')$([[ $RESET == 1 ]] && echo '  (RESET)')"
+
+# --reset: start from an empty history. The old log is kept as a timestamped backup.
+HISTORY="$APPLIED_LOG"
+if (( RESET )); then
+  if (( DRY_RUN )); then
+    HISTORY=/dev/null
+    info "Reset (dry run): treating the history as empty; $APPLIED_LOG is left untouched"
+  else
+    if [[ -s $APPLIED_LOG ]]; then
+      bak="$APPLIED_LOG.$(date +%Y%m%d-%H%M%S).bak"
+      mv "$APPLIED_LOG" "$bak"; info "Reset: history moved to $bak"
+    else info "Reset: no existing history"; fi
+    : >"$APPLIED_LOG"
+  fi
+  info "Reset: expecting a clean (unpatched) vendor/ — anything already patched will be reported, not re-applied"
+fi
 
 # ------------------------------------------------------ version detection ---
 php_json() {  # php_json <file> <php-expr using $j>
@@ -333,7 +355,7 @@ foreach ($areaVer as $area => $iv) {
     }
 }
 PHP
-php "$TMP_DIR/plan.php" "$REG_FILE" "$MAGENTO_ROOT" "$INSTALLED" "$APPLIED_LOG" >"$TMP_DIR/plan.tsv" \
+php "$TMP_DIR/plan.php" "$REG_FILE" "$MAGENTO_ROOT" "$INSTALLED" "$HISTORY" >"$TMP_DIR/plan.tsv" \
   || die "Registry planner failed (php error)"
 
 BASE_URL=""; UNSUPPORTED=""; declare -a PLAN=() SKIPS=() UPGRADES=()
@@ -476,7 +498,7 @@ in_place_under_later() {
 apply_unit() {
   local id="$1"; shift
   local f out n=0 rel; local -a done_files=()
-  U_NEW=0; U_ALREADY=0; U_NA=0; U_NOTE=""
+  U_NEW=0; U_ALREADY=0; U_NA=0; U_NOTE=""; U_HAVE=0
   rollback() {
     local i
     for (( i=${#done_files[@]}-1; i>=0; i-- )); do P -R -s <"${done_files[$i]}" || warn "  rollback failed: ${done_files[$i]}"; done
@@ -511,6 +533,7 @@ apply_unit() {
       fi
       P -s <"$sec"; cp "$sec" "$sec.applied"; done_files+=("$sec.applied"); n_done=$((n_done + 1))
     done
+    U_HAVE=$((U_HAVE + n_have))
     if (( n_done == 0 )); then
       info "    = $rel (already applied)"; U_ALREADY=$((U_ALREADY + 1)); continue
     fi
@@ -540,7 +563,7 @@ done
 # Every planned patch is fetched (and sha256-checked) before anything is applied: deciding
 # whether a file is already patched needs to see the later patches in the chain that touch
 # the same file (e.g. July creates vendor/bin/patch-status, August then modifies it).
-declare -A DL_WHY=()
+declare -A DL_WHY=(); declare -a NOT_CLEAN=()
 SECINDEX="$TMP_DIR/secindex.tsv"; : >"$SECINDEX"
 pos=0
 for line in "${PLAN[@]}"; do
@@ -606,6 +629,7 @@ for line in "${PLAN[@]}"; do
 
   if apply_unit "$id" "$dest"; then
     stamp="$(date '+%F %T %Z')"
+    if (( RESET && U_HAVE > 0 )); then NOT_CLEAN+=("$id"); fi
     if [[ $recorded == "$sha" && $UNIT_RESULT != applied ]]; then
       info "  verified: still in place"; continue          # recorded and present: nothing to report
     fi
@@ -637,6 +661,11 @@ for line in "${UPGRADES[@]}"; do
   row UPGRADE "$latest" "$area $cur -> $newer" "— $count patch(es) need $newer"
   (( RC == 0 )) && RC=2
 done
+
+if (( ${#NOT_CLEAN[@]} )); then
+  warn "Reset expected a clean vendor/, but ${#NOT_CLEAN[@]} patch(es) were already fully or partly in place: ${NOT_CLEAN[*]}. Nothing was applied twice. If you need a true clean baseline, rebuild vendor/ (e.g. rm -rf vendor && composer install) and run --reset again."
+  row NOT-CLEAN "-" "vendor/ was not clean" "— ${#NOT_CLEAN[@]} patch(es) already in place (see warning above)"
+fi
 
 if [[ -n $UNSUPPORTED ]]; then
   alert "Unsupported version" "No patch in Adobe's registry applies to Magento $UNSUPPORTED — this release line is likely out of security support. Plan an upgrade to a supported version."
