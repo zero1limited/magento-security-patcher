@@ -1,6 +1,6 @@
 # magento-security-patcher
 
-Applies Adobe's monthly Magento security patch bundles with one command. It finds the bundles, downloads them, checks they match the installed version and applies them in release-date order.
+Brings a Magento / Adobe Commerce install up to date with Adobe's isolated security patches in one command. Adobe's official [patch registry](https://repo.magento.com/patch/patch-registry.json) drives what gets applied, so nothing is guessed. Each patch is checked against what's actually installed, applied in the order its `requires` chain demands, and verified against the registry's sha256 before anything is touched.
 
 Maintained by [ZERO-1](https://www.zero1.co.uk).
 
@@ -15,67 +15,72 @@ curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patch
 Pass options after `bash -s --`:
 
 ```bash
-# Dry run: download and test-apply only, change nothing
+# Dry run: download, verify and test every patch; change nothing
 curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patcher.sh | bash -s -- -n
 
-# Point at a different Magento root
-curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patcher.sh | bash -s -- -r /var/www/magento
+# Real run with Slack alerts
+curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patcher.sh | bash -s -- --webhook https://hooks.slack.com/services/T000/B000/XXXX
+
+# Webhook from an environment variable (keeps it out of shell history); note it goes on the bash side of the pipe
+curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patcher.sh | ALERT_WEBHOOK=https://hooks.slack.com/services/T000/B000/XXXX bash
 ```
 
 Always keep the `-f` in `curl -fsSL`. Without it, a 404 or GitHub error page gets passed to bash and run as commands.
 
-## What it does
+## How it works
 
-1. **Detects the installed version** from `php bin/magento -V`. If that fails it falls back to `composer.lock`, then `composer.json`.
-2. **Finds the bundles** in two ways:
-   - It reads the [list of known bundles](patches.txt) in this repo on every run.
-   - It checks `https://repo.magento.com/patch/` and `https://repo.magento.com/patch/auth/` for files named like `2-4-7-p10-sep-2026.zip`, for every month from the last bundle it applied up to next month (the last 6 months on the first run). That's how next month's bundle gets picked up automatically, even before it's added to the list.
-3. **Applies them in date order.** Each bundle is unpacked and all of its `.patch`/`.diff` files are applied with `patch -p1` from the Magento root. Where Adobe ships both a composer-format and a git-format version of a patch, it picks the one that matches how Magento is installed.
-4. **Checks every patch applies to this site.** Before applying anything, it reads the `---`/`+++` file headers in each patch and checks each target file against the install:
+1. **Reads the registry** from `https://repo.magento.com/patch/patch-registry.json`. The script refuses a registry whose `patch_base_url` isn't on `https://repo.magento.com/`.
+2. **Detects what's installed, per area.** The registry splits patches by area:
+   - **CE** uses the Magento version, from `bin/magento -V`, falling back to `composer.lock` / `composer.json`.
+   - **Every other area** (EE, B2B, PageBuilder, Inventory, …) uses the version of its composer package. It reads `vendor/composer/installed.json` first because that's what's actually on disk, then `composer.lock`. For example, B2B uses the version of `magento/extension-b2b`, such as `1.5.3`.
+3. **Selects the patches** whose `area` is installed and whose `applies_to` includes that area's exact installed version.
+4. **Resolves `requires`.** Every prerequisite must be in the plan or already applied. If one can't be met (not in the registry, or for a different version), the patch is **blocked**, along with anything that depends on it.
+5. **Orders the patches** topologically on `requires`, with ties broken by `released` date. For example, Sep requires Aug, which requires Jul, and the standalone `VULN-*` hotfixes slot in by date.
+6. **Downloads and verifies each `.diff`.** Patches with `entitlements` (extended-support versions) come from `/patch/auth/` using your repo.magento.com keys. Every file's **sha256 must match the registry** or it's deleted and not applied.
+7. **Checks the patch targets.** Every `---`/`+++` target is checked against the install:
    - **Target exists:** the change is applied.
-   - **Whole package not installed** (for example a B2B patch for `magento/module-company` on a CE site): reported as **Not Applicable** and skipped. If only some files in a patch are N/A, the rest of that patch is still applied.
-   - **Package installed but the file is missing:** treated as an error, because it means the version doesn't match or core files have been removed or overridden. An alert is raised and the bundle is rolled back.
-5. **Rolls back on failure.** If any patch in a bundle won't apply cleanly, the patches already applied from that bundle are undone, an alert is raised, and no later bundles are attempted.
-6. **Stops if the site needs upgrading.** If a bundle needs a higher patch level than is installed (for example the bundle is for `2.4.7-p10` and the site is on `2.4.7-p9`), it raises an alert saying which version to upgrade to and applies nothing from that point on.
-7. **Records what it did.** It flushes the cache and writes each bundle's release month and the time it was applied to `var/security-patches/applied.log`.
+   - **Whole package not installed:** reported as **Not Applicable** and skipped. If only some files in a patch are N/A, the rest of that patch is still applied.
+   - **Package installed but the file is missing:** treated as a failure.
+8. **Applies each patch with the same strictness as Adobe's own `vendor/bin/patch-status` tool:** `patch -p1 --fuzz=0 --batch --forward`. A patch that's already applied is detected and recorded rather than re-applied. If a patch fails, nothing from it is applied, the patches that depend on it are skipped, and unrelated patches still go ahead.
+9. **Reports and alerts:**
+   - If newer patches exist for a higher patch level on your release line (e.g. you're on `2.4.7-p9` and patches exist for `2.4.7-p10`), it raises an **upgrade alert**.
+   - If no registry patch applies to your version at all, it raises an **unsupported-version alert**.
+   - Everything applied is written to `var/security-patches/applied.log`.
 
-Running it again is safe. Bundles and patches that are already in place are detected and skipped, including ones applied by hand.
+Running it again is safe and quick, because applied patches are recorded and skipped. When Adobe adds a new month to the registry, the next run picks it up automatically.
+
+## Dry run
+
+`-n` downloads and verifies every patch, then applies the whole chain to a **scratch copy** of the affected files. Each chained patch (Jul → Aug → Sep) is tested against the result of the one before it, exactly as a real run would apply it. Nothing in the Magento install changes, and webhook/email alerts are logged but not sent. The only writes are to `var/security-patches/` (downloads, `run.log`, lock file).
 
 ## Options
 
 | Option | Description |
 |---|---|
 | `-r, --root DIR` | Magento root (default: current directory) |
-| `-l, --list FILE` | Local file of extra bundle zip URLs to apply, one per line (`#` comments allowed) |
-| `--known-list URL` | Central list of known bundles (default: `patches.txt` in this repo) |
-| `--no-known-list` | Don't fetch the central list |
-| `-b, --base-url URL` | Location to look for bundles in (can be repeated; default `https://repo.magento.com/patch` and `https://repo.magento.com/patch/auth`) |
-| `--lookback N` | Months to look back when there's no history yet (default 6) |
-| `--lookahead N` | Months ahead of today to check (default 1) |
-| `-n, --dry-run` | Download and test-apply only, change nothing |
+| `--registry URL\|FILE` | Patch registry (default: `https://repo.magento.com/patch/patch-registry.json`) |
+| `-n, --dry-run` | Download, verify and test every patch against a scratch copy; change nothing |
 | `--no-cache-flush` | Don't run `cache:flush` afterwards |
 | `--compile` | Run `setup:di:compile` after applying |
-| `--webhook URL` | Send alerts to a Slack-style incoming webhook |
-| `--email ADDR` | Email alerts (needs a working `mail` command) |
+| `--webhook URL` | Send alerts to a Slack-style incoming webhook (not sent on dry runs) |
+| `--email ADDR` | Email alerts (needs a working `mail` command; not sent on dry runs) |
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Success, or nothing to do |
-| 1 | Error (download, auth, environment) |
-| 2 | Upgrade required before the next bundle can be applied |
-| 3 | A patch wouldn't apply cleanly, or targets a file missing from an installed package; that bundle was rolled back |
+| 0 | Up to date, or everything applicable was applied |
+| 1 | Error (registry unavailable, environment problem) |
+| 2 | Newer patches need a version upgrade, or the version is unsupported |
+| 3 | A patch failed: conflict, missing target file, download/auth failure, or sha256 mismatch |
 
-## Adding new bundles
+### What reaches Slack / email
 
-When Adobe publishes a new month's bundles, add their URLs to [`patches.txt`](patches.txt) and push. Every site picks them up on its next run, and the order of lines in the file doesn't matter because bundles are always applied by release date.
-
-Only `https://repo.magento.com/` URLs are accepted from this file, so a bad edit can't point sites at a zip hosted anywhere else.
+Only problems are sent: upgrade required, unsupported version, a patch failed or wouldn't apply cleanly, a sha256 mismatch, a download or authentication failure, or the registry being unavailable or rejected. Successful runs aren't posted; the summary goes to the terminal and `var/security-patches/run.log`.
 
 ## Credentials
 
-repo.magento.com access keys are read from the first of these that exists:
+Most patches are public. Patches with `entitlements` in the registry (currently the extended-support 2.4.4–2.4.6 and older B2B lines) need repo.magento.com keys with the matching entitlement, read from the first of these that exists:
 
 1. `$MAGENTO_REPO_USER` / `$MAGENTO_REPO_PASS`
 2. `<magento root>/auth.json`
@@ -88,13 +93,16 @@ The keys are only ever sent to `repo.magento.com`.
 Point cron at a **tagged release**, not `master`. Otherwise every push to `master` runs as-is on client servers.
 
 ```cron
-# 06:00 daily: picks up a new bundle as soon as Adobe publishes it
-0 6 * * * cd /var/www/magento && bash <(curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/v1.0.0/patcher.sh) --webhook https://hooks.slack.com/services/XXX >> /var/log/magento-patcher.log 2>&1
+# 06:00 daily: picks up new registry patches as soon as Adobe publishes them
+0 6 * * * cd /var/www/magento && bash <(curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/v2.0.0/patcher.sh) --webhook https://hooks.slack.com/services/XXX >> /var/log/magento-patcher.log 2>&1
 ```
+
+On instances built without `var/` (e.g. fresh development replicas), there's no history, so every applicable patch is evaluated from scratch against what's actually installed. Run the patcher **after** `composer install`, which would otherwise wipe patched files under `vendor/`, and before `setup:upgrade` / `setup:di:compile`.
 
 ## Notes
 
-- **Requirements:** bash 4+, GNU `date`, `wget`, `unzip`, `patch` and `php`. That covers any standard Linux Magento host; macOS's built-in `date` won't work.
+- **Requirements:** bash 4+, GNU `date`, `wget`, `unzip`, `patch`, `php`, `awk` and `sha256sum` (or `shasum`). That covers any standard Linux Magento host.
 - **`composer install` removes the patches.** Anything applied under `vendor/` is overwritten by `composer install` or `composer update`, so run the patcher again afterwards.
 - **Production mode:** run `setup:di:compile` (or use `--compile`) and `setup:static-content:deploy` after patching if the patches touched PHP classes or frontend assets.
+- **Adobe's status tool:** the July 2026 patches install Adobe's own checker at `vendor/bin/patch-status`. It reads the same registry, so you can run it afterwards to cross-check what this script applied.
 - **Concurrent runs:** a lock file stops two runs from overlapping.
