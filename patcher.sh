@@ -43,6 +43,7 @@ DRY_RUN=0
 CACHE_FLUSH=1
 DI_COMPILE=0
 RESET=0
+CHECK=0
 
 usage() {
   cat <<EOF
@@ -52,6 +53,9 @@ Usage: patcher.sh [options]
   -r, --root DIR          Magento root (default: current directory)
       --registry URL|FILE Patch registry (default: $REGISTRY)
   -n, --dry-run           Download, verify and test every patch against a scratch copy; change nothing
+      --check             Report only: for every patch that applies to this install, state whether it is
+                          definitely APPLIED, definitely MISSING, PARTIAL, N/A or UNKNOWN (can't be
+                          determined). Checks the files themselves (ignores history); changes nothing.
       --reset             Start from a clean history: back up and remove var/security-patches/applied.log,
                           then patch on the expectation that vendor/ is clean (e.g. straight after a fresh
                           composer install). Anything found already patched is reported, never re-applied.
@@ -77,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     -n|--dry-run)     DRY_RUN=1; shift ;;
     --no-cache-flush) CACHE_FLUSH=0; shift ;;
     --reset)          RESET=1; shift ;;
+    --check)          CHECK=1; DRY_RUN=1; shift ;;
     --compile)        DI_COMPILE=1; shift ;;
     --webhook)        ALERT_WEBHOOK="$2"; shift 2 ;;
     --email)          ALERT_EMAIL="$2"; shift 2 ;;
@@ -108,6 +113,7 @@ die()  { log ERROR "$*"; exit 1; }
 json_str() { php -r 'echo json_encode($argv[1]);' "$1"; }
 
 alert() {   # alert "<subject>" "<body>"
+  if (( CHECK )); then log WARN "$1 — $2"; return 0; fi
   log ALERT "$1 — $2"
   if (( DRY_RUN )); then
     [[ -n $ALERT_WEBHOOK || -n $ALERT_EMAIL ]] && info "(dry run — alert not sent to webhook/email)"
@@ -145,10 +151,11 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 trap 'log ERROR "Unexpected failure at line $LINENO"' ERR
 
-info "${C_B}Magento security patcher${C_0} — root: $MAGENTO_ROOT$([[ $DRY_RUN == 1 ]] && echo '  (DRY RUN)')$([[ $RESET == 1 ]] && echo '  (RESET)')"
+info "${C_B}Magento security patcher${C_0} — root: $MAGENTO_ROOT$([[ $DRY_RUN == 1 ]] && echo '  (DRY RUN)')$([[ $RESET == 1 ]] && echo '  (RESET)')$([[ $CHECK == 1 ]] && echo '  (CHECK — report only)')"
 
 # --reset: start from an empty history. The old log is kept as a timestamped backup.
 HISTORY="$APPLIED_LOG"
+if (( CHECK )); then HISTORY=/dev/null; RESET=0; fi
 if (( RESET )); then
   if (( DRY_RUN )); then
     HISTORY=/dev/null
@@ -498,7 +505,7 @@ in_place_under_later() {
 apply_unit() {
   local id="$1"; shift
   local f out n=0 rel; local -a done_files=()
-  U_NEW=0; U_ALREADY=0; U_NA=0; U_NOTE=""; U_HAVE=0
+  U_NEW=0; U_ALREADY=0; U_NA=0; U_NOTE=""; U_HAVE=0; U_DONE=0
   rollback() {
     local i
     for (( i=${#done_files[@]}-1; i>=0; i-- )); do P -R -s <"${done_files[$i]}" || warn "  rollback failed: ${done_files[$i]}"; done
@@ -529,11 +536,14 @@ apply_unit() {
       if ! out="$(P --dry-run <"$sec" 2>&1)"; then
         if in_place_under_later "$tgt" "$sec"; then n_have=$((n_have + 1)); continue; fi   # since changed by a later patch
         log ERROR "    x $rel: $tgt is neither patched nor patchable:"; printf '%s\n' "$out" | sed 's/^/        /' | tee -a "$RUN_LOG" >&2
-        rollback; U_NOTE="$tgt does not apply cleanly (modified core file or a vendor override?)"; return 3
+        rollback
+        if (( CHECK )); then U_NOTE="can't tell: $tgt matches neither the patched nor the unpatched code (edited locally, or a different version of the fix?)"
+        else U_NOTE="$tgt does not apply cleanly (modified core file or a vendor override?)"; fi
+        return 3
       fi
       P -s <"$sec"; cp "$sec" "$sec.applied"; done_files+=("$sec.applied"); n_done=$((n_done + 1))
     done
-    U_HAVE=$((U_HAVE + n_have))
+    U_HAVE=$((U_HAVE + n_have)); U_DONE=$((U_DONE + n_done))
     if (( n_done == 0 )); then
       info "    = $rel (already applied)"; U_ALREADY=$((U_ALREADY + 1)); continue
     fi
@@ -552,7 +562,13 @@ apply_unit() {
 # ------------------------------------------------------------ apply plan ----
 declare -A FAILED=()
 SUMMARY=(); ANY_APPLIED=0; RC=0
-row() { SUMMARY+=("$(printf '%-9s %s  %-28s %s' "$1" "$2" "$3" "$4")"); }
+declare -A TALLY=()
+row() {
+  local what="$1"
+  if (( CHECK )); then case "$what" in BLOCKED|SKIPPED|FAILED) what=UNKNOWN ;; esac; fi
+  TALLY[$what]=$(( ${TALLY[$what]:-0} + 1 ))
+  SUMMARY+=("$(printf '%-9s %s  %-28s %s' "$what" "$2" "$3" "$4")")
+}
 
 for line in "${SKIPS[@]}"; do
   IFS=$'\t' read -r id area rel why <<<"$line"
@@ -629,6 +645,18 @@ for line in "${PLAN[@]}"; do
 
   if apply_unit "$id" "$dest"; then
     stamp="$(date '+%F %T %Z')"
+    if (( CHECK )); then
+      # Verdicts are file-by-file at fuzz 0, judged on top of earlier patches in the chain:
+      #   APPLIED = every file's change is exactly in place; MISSING = no file's change is in place
+      #   and every one applies cleanly; PARTIAL = some files in place, the rest apply cleanly
+      case "$UNIT_RESULT" in
+        already) row APPLIED "$rel" "$id" "($label)" ;;
+        na)      row N/A "$rel" "$id" "($label)${U_NOTE:+ — $U_NOTE}" ;;
+        applied) if (( U_HAVE > 0 )); then row PARTIAL "$rel" "$id" "($label) — $U_HAVE of $((U_HAVE + U_DONE)) files in place, $U_DONE missing"
+                 else row MISSING "$rel" "$id" "($label)"; fi ;;
+      esac
+      continue
+    fi
     if (( RESET && U_HAVE > 0 )); then NOT_CLEAN+=("$id"); fi
     if [[ $recorded == "$sha" && $UNIT_RESULT != applied ]]; then
       info "  verified: still in place"; continue          # recorded and present: nothing to report
@@ -683,10 +711,25 @@ if (( ANY_APPLIED && ! DRY_RUN )); then
   warn "Patches under vendor/ are overwritten by 'composer install' — re-run this script after any composer install/update"
 fi
 
+if (( CHECK )); then
+  if   (( ${TALLY[UNKNOWN]:-0} )); then RC=3
+  elif (( ${TALLY[MISSING]:-0} + ${TALLY[PARTIAL]:-0} )); then RC=4
+  elif (( ${TALLY[UPGRADE]:-0} + ${TALLY[UNSUPPORTED]:-0} )); then RC=2
+  else RC=0; fi
+fi
+
 echo >&2
-printf '%s\n' "${C_B}Summary for $MAGENTO_ROOT (Magento $INSTALLED)$([[ $DRY_RUN == 1 ]] && echo ' — DRY RUN, nothing changed')${C_0}" >&2
+if (( CHECK )); then
+  printf '%s\n' "${C_B}Patch status for $MAGENTO_ROOT (Magento $INSTALLED) — CHECK, nothing changed${C_0}" >&2
+else
+  printf '%s\n' "${C_B}Summary for $MAGENTO_ROOT (Magento $INSTALLED)$([[ $DRY_RUN == 1 ]] && echo ' — DRY RUN, nothing changed')${C_0}" >&2
+fi
 if (( ${#SUMMARY[@]} )); then printf '  %s\n' "${SUMMARY[@]}" | tee -a "$RUN_LOG" >&2
 else printf '  %s\n' "Up to date — every registry patch for this install is already applied." >&2; fi
+if (( CHECK )); then
+  printf '  Totals: %s applied, %s missing, %s partial, %s N/A, %s unknown\n' "${TALLY[APPLIED]:-0}" "${TALLY[MISSING]:-0}" \
+    "${TALLY[PARTIAL]:-0}" "${TALLY[N/A]:-0}" "${TALLY[UNKNOWN]:-0}" | tee -a "$RUN_LOG" >&2
+fi
 echo "  History: $APPLIED_LOG   Log: $RUN_LOG" >&2
 exit "$RC"
 }

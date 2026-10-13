@@ -53,6 +53,32 @@ Running it again is safe. **Every run checks the actual files; it never trusts t
 
 `-n` downloads and verifies every patch, then applies the whole chain to a **scratch copy** of the affected files. Each chained patch (Jul → Aug → Sep) is tested against the result of the one before it, exactly as a real run would apply it. Nothing in the Magento install changes, and webhook/email alerts are logged but not sent. The only writes are to `var/security-patches/` (downloads, `run.log`, lock file).
 
+## Check
+
+`--check` reports the patch status of an install without changing anything. It ignores `applied.log` entirely, so the verdict comes from the files alone. That makes it the right tool for auditing a site, including patches applied some other way, e.g. by composer-patches.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patcher/master/patcher.sh | bash -s -- --check
+```
+
+Every registry patch that applies to the install gets one of these verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `APPLIED` | Definitely applied: every file's change is exactly in place |
+| `MISSING` | Definitely not applied: none of the changes are in place, and every one applies cleanly |
+| `PARTIAL` | Some files' changes are in place and the rest apply cleanly (typically after `vendor/` was rebuilt but `lib/` or `pub/` weren't). The row says how many of each. |
+| `N/A` | Targets packages that aren't installed |
+| `UNKNOWN` | Can't be determined: a target file matches neither the patched nor the unpatched code (edited locally, or a different version of the fix), the download failed, or it depends on a patch that's `UNKNOWN` |
+
+How the verdicts are decided:
+
+- **File by file, at fuzz 0:** a change only counts as present or absent if it matches exactly.
+- **In chain order:** August is judged as it would sit on top of July, so a chain where only some months are applied is reported correctly.
+- **`APPLIED` and `MISSING` are only given when they're certain.** Anything ambiguous is `UNKNOWN`.
+
+Exit codes for `--check`: `0` everything applicable is applied, `4` something is missing or partial, `3` something is unknown, `2` upgrade required or unsupported version.
+
 ## Reset
 
 `--reset` starts from a clean slate. Use it straight after rebuilding `vendor/` (e.g. `rm -rf vendor && composer install`) when you want the whole patch chain applied from scratch and recorded fresh.
@@ -73,6 +99,7 @@ curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patch
 | `-r, --root DIR` | Magento root (default: current directory) |
 | `--registry URL\|FILE` | Patch registry (default: `https://repo.magento.com/patch/patch-registry.json`) |
 | `-n, --dry-run` | Download, verify and test every patch against a scratch copy; change nothing |
+| `--check` | Report only: which patches are definitely applied, missing or partial; changes nothing. See [Check](#check) |
 | `--reset` | Start from a clean history and expect a clean (unpatched) `vendor/`; see [Reset](#reset) |
 | `--no-cache-flush` | Don't run `cache:flush` afterwards |
 | `--compile` | Run `setup:di:compile` after applying |
@@ -86,7 +113,8 @@ curl -fsSL https://raw.githubusercontent.com/zero1limited/magento-security-patch
 | 0 | Up to date, or everything applicable was applied |
 | 1 | Error (registry unavailable, environment problem) |
 | 2 | Newer patches need a version upgrade, or the version is unsupported |
-| 3 | A patch failed: conflict, missing target file, download/auth failure, or sha256 mismatch |
+| 3 | A patch failed: conflict, missing target file, download/auth failure, or sha256 mismatch (with `--check`: status unknown for at least one patch) |
+| 4 | `--check` only: at least one patch is missing or partially applied |
 
 ### What reaches Slack / email
 
