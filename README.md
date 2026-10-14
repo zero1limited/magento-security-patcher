@@ -143,7 +143,7 @@ On instances built without `var/` (e.g. fresh development replicas), there's no 
 
 ## Notes
 
-- **Requirements:** bash 4+, GNU `date`, `wget`, `patch`, `php`, `awk` and `sha256sum` (or `shasum`). That covers any standard Linux Magento host.
+- **Requirements:** bash 4.2+ (works on older shared hosting such as CentOS/CloudLinux 7), GNU `date`, `wget`, `patch`, `php`, `awk` and `sha256sum` (or `shasum`). That covers any standard Linux Magento host.
 - **`composer install` removes the patches.** Anything applied under `vendor/` is overwritten by `composer install` or `composer update`, so run the patcher again afterwards.
 - **Production mode:** run `setup:di:compile` (or use `--compile`) and `setup:static-content:deploy` after patching if the patches touched PHP classes or frontend assets.
 - **Adobe's status tool:** the July 2026 patches install Adobe's own checker at `vendor/bin/patch-status`. It reads the same registry, so you can run it afterwards to cross-check what this script applied.

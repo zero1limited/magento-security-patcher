@@ -20,7 +20,7 @@
 #
 #  Usage:  curl -fsSL <raw-url>/patcher.sh | bash -s -- [options]
 #          ./patcher.sh [options]          (run with -h for options)
-#  Needs:  bash 4+, GNU date, wget, patch, php, awk, sha256sum/shasum
+#  Needs:  bash 4.2+, GNU date, wget, patch, php, awk, sha256sum/shasum
 #
 #  Exit codes: 0 up to date, 1 error, 2 newer patches need a version upgrade,
 #              3 a patch failed (conflict / missing file / download / hash)
@@ -30,6 +30,9 @@
 # script is piped (curl ... | bash) this means a truncated download runs nothing,
 # and no command inside can read the rest of the script from stdin.
 main() {
+# Compatibility: must run on bash 4.2+ (CentOS/CloudLinux 7 shared hosting). Before bash 4.4, expanding
+# an EMPTY array under `set -u` is an "unbound variable" error, so every array expansion is written
+# ${arr[@]+"${arr[@]}"}. Keep it that way.
 set -Eeuo pipefail
 export LC_ALL=C
 
@@ -472,13 +475,13 @@ assess_patch() {
     fi
   done < <(awk -v dir="$work/sec" "$PATCH_SPLIT_AWK" "$f")
   AP_OK=${#keep[@]}
-  AP_NA_PKGS="$(printf '%s\n' "${!na_pkgs[@]}" | grep -v '^$' | sort | paste -sd, - | sed 's/,/, /g' || true)"
+  AP_NA_PKGS="$(printf '%s\n' ${na_pkgs[@]+"${!na_pkgs[@]}"} | grep -v '^$' | sort | paste -sd, - | sed 's/,/, /g' || true)"
   if (( AP_TOTAL == 0 )); then AP_STATUS=missing; AP_MISSING+="no file headers (--- / +++) found"$'\n'
   elif [[ -n $AP_MISSING ]]; then AP_STATUS=missing
   elif (( AP_OK == 0 )); then AP_STATUS=na
   elif (( AP_OK < AP_TOTAL )); then
     AP_STATUS=partial; AP_FILE="$work/applicable.patch"
-    for idx in "${keep[@]}"; do cat "$work/sec/$idx.diff"; done >"$AP_FILE"
+    for idx in ${keep[@]+"${keep[@]}"}; do cat "$work/sec/$idx.diff"; done >"$AP_FILE"
   else AP_STATUS=ok; fi
 }
 
@@ -528,7 +531,7 @@ apply_unit() {
     # Checked file by file: after a vendor/ rebuild a patch can be half in place (e.g. its
     # vendor/ files reverted but lib/ or pub/ files still patched). Files already patched are
     # skipped, the rest applied; any file that is neither -> roll back the whole patch.
-    shadow_prepare "${AP_TARGETS[@]}"
+    shadow_prepare ${AP_TARGETS[@]+"${AP_TARGETS[@]}"}
     local i sec tgt n_done=0 n_have=0
     for (( i=0; i<${#AP_SECS[@]}; i++ )); do
       sec="${AP_SECS[$i]}"; tgt="${AP_TARGETS[$i]}"
@@ -570,7 +573,7 @@ row() {
   SUMMARY+=("$(printf '%-9s %s  %-28s %s' "$what" "$2" "$3" "$4")")
 }
 
-for line in "${SKIPS[@]}"; do
+for line in ${SKIPS[@]+"${SKIPS[@]}"}; do
   IFS=$'\t' read -r id area rel why <<<"$line"
   FAILED[$id]=blocked; warn "Blocked: $id — $why"; row BLOCKED "$rel" "$id" "— $why"
 done
@@ -582,7 +585,7 @@ done
 declare -A DL_WHY=(); declare -a NOT_CLEAN=()
 SECINDEX="$TMP_DIR/secindex.tsv"; : >"$SECINDEX"
 pos=0
-for line in "${PLAN[@]}"; do
+for line in ${PLAN[@]+"${PLAN[@]}"}; do
   IFS=$'\t' read -r id area ver file sha rel reqs recorded ncve entitled <<<"$line"
   dest="$DL_DIR/$file"; url="$BASE_URL/$file"   # exactly as the registry says; the server redirects entitled patches itself
   if [[ ! -s $dest || "$(sha256 "$dest")" != "$sha" ]]; then
@@ -608,7 +611,7 @@ for line in "${PLAN[@]}"; do
 done
 
 pos=0
-for line in "${PLAN[@]}"; do
+for line in ${PLAN[@]+"${PLAN[@]}"}; do
   IFS=$'\t' read -r id area ver file sha rel reqs recorded ncve entitled <<<"$line"
   CUR_POS=$pos; pos=$((pos + 1))
   label="$area $ver, $ncve CVE$([[ $ncve == 1 ]] || echo s)"
@@ -618,7 +621,7 @@ for line in "${PLAN[@]}"; do
   blocker=""
   if [[ $reqs != - ]]; then
     IFS=, read -r -a req_arr <<<"$reqs"
-    for r in "${req_arr[@]}"; do [[ -n ${FAILED[$r]:-} ]] && { blocker="$r"; break; }; done
+    for r in ${req_arr[@]+"${req_arr[@]}"}; do [[ -n ${FAILED[$r]:-} ]] && { blocker="$r"; break; }; done
   fi
   if [[ -n $blocker ]]; then
     FAILED[$id]=blocked; warn "  Skipped — requires $blocker, which failed"; row SKIPPED "$rel" "$id" "— requires $blocker, which failed"; continue
@@ -683,7 +686,7 @@ for line in "${PLAN[@]}"; do
   fi
 done
 
-for line in "${UPGRADES[@]}"; do
+for line in ${UPGRADES[@]+"${UPGRADES[@]}"}; do
   IFS=$'\t' read -r area cur newer count latest <<<"$line"
   alert "Upgrade required" "$area is on $cur, but $count newer security patch(es) up to $latest only apply to $newer. Upgrade $area to $newer to receive them."
   row UPGRADE "$latest" "$area $cur -> $newer" "— $count patch(es) need $newer"
@@ -724,7 +727,7 @@ if (( CHECK )); then
 else
   printf '%s\n' "${C_B}Summary for $MAGENTO_ROOT (Magento $INSTALLED)$([[ $DRY_RUN == 1 ]] && echo ' — DRY RUN, nothing changed')${C_0}" >&2
 fi
-if (( ${#SUMMARY[@]} )); then printf '  %s\n' "${SUMMARY[@]}" | tee -a "$RUN_LOG" >&2
+if (( ${#SUMMARY[@]} )); then printf '  %s\n' ${SUMMARY[@]+"${SUMMARY[@]}"} | tee -a "$RUN_LOG" >&2
 else printf '  %s\n' "Up to date — every registry patch for this install is already applied." >&2; fi
 if (( CHECK )); then
   printf '  Totals: %s applied, %s missing, %s partial, %s N/A, %s unknown\n' "${TALLY[APPLIED]:-0}" "${TALLY[MISSING]:-0}" \
